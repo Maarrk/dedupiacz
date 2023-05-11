@@ -1,24 +1,23 @@
 const std = @import("std");
+const clap = @import("clap");
+// const clap = @import("../libs/zig-clap/clap.zig"); // For ZLS completions, not allowed when building
 
 pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help    Wyświetl tę pomoc i wyjdź.
+    );
 
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
+    var diag = clap.Diagnostic{};
+    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
+        .diagnostic = &diag,
+    }) catch |err| {
+        diag.report(std.io.getStdErr().writer(), err) catch {};
+        return err;
+    };
+    defer res.deinit();
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+    if (res.args.help)
+        return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
 
-    try bw.flush(); // don't forget to flush!
-}
-
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+    try std.io.getStdOut().writer().print("Witaj, świecie!\n", .{});
 }

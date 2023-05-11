@@ -12,6 +12,7 @@ pub fn build(b: *std.build.Builder) void {
     const mode = b.standardReleaseOptions();
 
     const exe = b.addExecutable("dedupiacz", "src/main.zig");
+    exe.addPackagePath("clap", "libs/zig-clap/clap.zig");
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.install();
