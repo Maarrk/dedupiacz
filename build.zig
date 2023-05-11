@@ -15,6 +15,7 @@ pub fn build(b: *std.build.Builder) void {
     exe.addPackagePath("clap", "libs/zig-clap/clap.zig");
     exe.setTarget(target);
     exe.setBuildMode(mode);
+    exe.linkLibC(); // for <windows.h> to set the code page
     exe.install();
 
     const run_cmd = exe.run();

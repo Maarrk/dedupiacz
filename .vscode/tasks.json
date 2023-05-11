@@ -12,6 +12,18 @@
                 "kind": "build",
                 "isDefault": true
             }
+        },
+        {
+            "label": "run",
+            "type": "shell",
+            "command": "zig build run",
+            "problemMatcher": [],
+        },
+        {
+            "label": "run help",
+            "type": "shell",
+            "command": "zig build run -- --help",
+            "problemMatcher": [],
         }
     ]
 }
