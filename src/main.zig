@@ -3,6 +3,20 @@ const builtin = @import("builtin");
 const clap = @import("clap");
 // const clap = @import("../libs/zig-clap/clap.zig"); // For ZLS completions, not allowed when building
 
+const MAX_PATH_LEN: comptime_int = 256;
+const HASH_LEN: comptime_int = 16;
+
+const FileInfo = struct {
+    full_path: [MAX_PATH_LEN]u8 = [_]u8{0} ** MAX_PATH_LEN,
+    size: u64,
+    hash: ?[HASH_LEN]u8 = null,
+
+    fn size_desc(context: void, a: FileInfo, b: FileInfo) bool {
+        _ = context;
+        return a.size > b.size;
+    }
+};
+
 pub fn main() !void {
     // On Windows, set the console code page to UTF-8
     if (builtin.os.tag == .windows) {
@@ -40,10 +54,14 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
 
-    var realpath_set = std.StringHashMap(?void).init(alloc);
+    var realpath_set = std.StringHashMap(void).init(alloc);
     defer realpath_set.deinit();
-    const realpath_buf: []u8 = try alloc.alloc(u8, 512);
+    const realpath_buf: []u8 = try alloc.alloc(u8, MAX_PATH_LEN);
     defer alloc.free(realpath_buf);
+
+    var file_count: u64 = 0;
+    var file_list = std.ArrayList(FileInfo).init(alloc);
+    defer file_list.deinit();
 
     // to match the types, cast array literal to "[]T - pointer to runtime-known number of items", hence the need for &
     var search_paths = if (res.positionals.len > 0) res.positionals else @as([]const []const u8, &[_][]const u8{"."});
@@ -54,15 +72,27 @@ pub fn main() !void {
             std.debug.print("Błąd: ścieżka '{s}' podana wielokrotnie (argument: '{s}')", .{ realpath, path });
             return;
         }
-        try realpath_set.put(realpath, null);
+        try realpath_set.put(realpath, {});
 
         var walker = try (try std.fs.cwd().openIterableDir(path, .{})).walk(alloc);
         defer walker.deinit();
 
         while (try walker.next()) |entry| {
             if (entry.kind != .File) continue;
+            file_count += 1;
+
             const stat = try entry.dir.statFile(entry.basename);
-            std.debug.print("{s}\t{d}\n", .{ entry.basename, stat.size });
+            const file_realpath = try entry.dir.realpath(entry.basename, realpath_buf);
+            var info = FileInfo{
+                .size = stat.size,
+            };
+            std.mem.copy(u8, &info.full_path, file_realpath);
+            try file_list.append(info);
         }
+    }
+
+    std.sort.sort(FileInfo, file_list.items, {}, FileInfo.size_desc);
+    for (file_list.items) |info| {
+        std.debug.print("{d}\t{s}\n", .{info.size, info.full_path});
     }
 }
