@@ -49,18 +49,20 @@ pub fn main() !void {
     var search_paths = if (res.positionals.len > 0) res.positionals else @as([]const []const u8, &[_][]const u8{"."});
     for (search_paths) |path| {
         const realpath = try std.fs.cwd().realpath(path, realpath_buf);
+        // FIXME: Doesn't detect duplication if one contains the other
         if (realpath_set.contains(realpath)) {
             std.debug.print("Błąd: ścieżka '{s}' podana wielokrotnie (argument: '{s}')", .{ realpath, path });
             return;
         }
         try realpath_set.put(realpath, null);
 
-        // TODO: see IterableDir.walk()
-        var iter = (try std.fs.cwd().openIterableDir(path, .{})).iterate();
+        var walker = try (try std.fs.cwd().openIterableDir(path, .{})).walk(alloc);
+        defer walker.deinit();
 
-        while (try iter.next()) |entry| {
-            const prefix: u8 = if (entry.kind == .Directory) 'd' else ' ';
-            std.debug.print("{c} {s}\n", .{ prefix, entry.name });
+        while (try walker.next()) |entry| {
+            if (entry.kind != .File) continue;
+            const stat = try entry.dir.statFile(entry.basename);
+            std.debug.print("{s}\t{d}\n", .{ entry.basename, stat.size });
         }
     }
 }
