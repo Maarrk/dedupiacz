@@ -28,18 +28,32 @@ pub fn main() !void {
         .diagnostic = &diag,
     }) catch |err| {
         diag.report(std.io.getStdErr().writer(), err) catch {};
-        return err;
+        return;
     };
     defer res.deinit();
 
-    if (res.args.help)
-        return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+    if (res.args.help) {
+        try clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+        return;
+    }
 
-    var path_count: usize = 0;
-    // TODO: change to an array that has "." if there are none
-    // TODO: error on duplicate directories (also when absolute and relative paths given)
-    for (res.positionals) |path| {
-        path_count += 1;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+
+    var realpath_set = std.StringHashMap(?void).init(alloc);
+    defer realpath_set.deinit();
+    const realpath_buf: []u8 = try alloc.alloc(u8, 512);
+    defer alloc.free(realpath_buf);
+
+    // to match the types, cast array literal to "[]T - pointer to runtime-known number of items", hence the need for &
+    var search_paths = if (res.positionals.len > 0) res.positionals else @as([]const []const u8, &[_][]const u8{"."});
+    for (search_paths) |path| {
+        const realpath = try std.fs.cwd().realpath(path, realpath_buf);
+        if (realpath_set.contains(realpath)) {
+            std.debug.print("Błąd: ścieżka '{s}' podana wielokrotnie (argument: '{s}')", .{ realpath, path });
+            return;
+        }
+        try realpath_set.put(realpath, null);
 
         // TODO: see IterableDir.walk()
         var iter = (try std.fs.cwd().openIterableDir(path, .{})).iterate();
@@ -48,10 +62,5 @@ pub fn main() !void {
             const prefix: u8 = if (entry.kind == .Directory) 'd' else ' ';
             std.debug.print("{c} {s}\n", .{ prefix, entry.name });
         }
-    }
-
-    if (path_count == 0) {
-        std.debug.print("Użycie:\n", .{});
-        return clap.usage(std.io.getStdErr().writer(), clap.Help, &params);
     }
 }
