@@ -129,7 +129,6 @@ pub fn main() !void {
     for (files) |info, i| {
         if (info.duplicate_size) {
             var hash = std.crypto.hash.Md5.init(.{});
-            std.debug.print("{s}\n", .{&info.full_path});
             var file = try std.fs.openFileAbsoluteZ(@ptrCast([*:0]const u8, &info.full_path), .{});
             defer file.close();
             var buf_reader = std.io.bufferedReader(file.reader());
@@ -147,6 +146,7 @@ pub fn main() !void {
         }
     }
 
+    var same_hash_count: u64 = 0;
     {
         var i: usize = 0;
         while (i < files.len) : (i += 1) {
@@ -155,6 +155,7 @@ pub fn main() !void {
                     if (files[i - 1].hash) |prev_hash| {
                         if (std.mem.eql(u8, &hash, &prev_hash)) {
                             files[i].duplicate_hash = true;
+                            same_hash_count += 1;
                             continue; // Skip comparison with next
                         }
                     }
@@ -164,15 +165,29 @@ pub fn main() !void {
                     if (files[i + 1].hash) |next_hash| {
                         if (std.mem.eql(u8, &hash, &next_hash)) {
                             files[i].duplicate_hash = true;
+                            same_hash_count += 1;
                         }
                     }
                 }
             }
         }
     }
+    std.debug.print("Znaleziono {d} plików o tej samej zawartości\n", .{same_hash_count});
 
-    for (file_list.items) |info| {
-        std.debug.print("{any} {s}\t{s}\t{any}\n", .{ info.duplicate_hash, format_size(info.size), info.full_path, info.hash });
+    {
+        var stdout = std.io.getStdOut();
+        var writer = stdout.writer();
+        var last_hash = [_]u8{0} ** HASH_LEN;
+        for (file_list.items) |info| {
+            if (info.duplicate_hash) {
+                const hash = info.hash.?;
+                if (!std.mem.eql(u8, &last_hash, &hash)) {
+                    try writer.print("\n", .{});
+                }
+                try writer.print("{s}\t{s}\n", .{ format_size(info.size), info.full_path });
+                std.mem.copy(u8, &last_hash, &hash);
+            }
+        }
     }
 }
 
@@ -188,9 +203,17 @@ fn format_size(size: u64) [5]u8 {
 
     var result = [_]u8{' '} ** 5;
     if (size_left < 10) {
-        _ = std.fmt.bufPrint(&result, "{d:.2}{c}", .{ size_left, suffixes[suffix_index] }) catch unreachable;
+        if (suffix_index == 0) {
+            _ = std.fmt.bufPrint(&result, "   {d}{c}", .{ size_left, suffixes[suffix_index] }) catch unreachable;
+        } else {
+            _ = std.fmt.bufPrint(&result, "{d:.2}{c}", .{ size_left, suffixes[suffix_index] }) catch unreachable;
+        }
     } else if (size_left < 100) {
-        _ = std.fmt.bufPrint(&result, "{d:.1}{c}", .{ size_left, suffixes[suffix_index] }) catch unreachable;
+        if (suffix_index == 0) {
+            _ = std.fmt.bufPrint(&result, "  {d}{c}", .{ size_left, suffixes[suffix_index] }) catch unreachable;
+        } else {
+            _ = std.fmt.bufPrint(&result, "{d:.1}{c}", .{ size_left, suffixes[suffix_index] }) catch unreachable;
+        }
     } else if (size_left < 1000) {
         _ = std.fmt.bufPrint(&result, " {d}{c}", .{ @floor(size_left), suffixes[suffix_index] }) catch unreachable;
     } else { // 1000 to 1023
