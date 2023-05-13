@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const clap = @import("clap");
 // const clap = @import("../libs/zig-clap/clap.zig"); // For ZLS completions, not allowed when building
 
-const MAX_PATH_LEN: comptime_int = 256;
+const MAX_PATH_LEN: comptime_int = 512;
 const HASH_LEN: comptime_int = 16;
 
 const FileInfo = struct {
@@ -79,9 +79,14 @@ pub fn main() !void {
         var walker = try (try std.fs.cwd().openIterableDir(path, .{})).walk(alloc);
         defer walker.deinit();
 
+        std.debug.print("\nIndeksowanie {s} ...", .{path});
         while (try walker.next()) |entry| {
             if (entry.kind != .File) continue;
+
             file_count += 1;
+            if (file_count % 100 == 0) {
+                std.debug.print("\rIndeksowanie {s} ... ({d} plików)", .{ path, file_count });
+            }
 
             const stat = try entry.dir.statFile(entry.basename);
             const file_realpath = try entry.dir.realpath(entry.basename, realpath_buf);
@@ -92,6 +97,7 @@ pub fn main() !void {
             try file_list.append(info);
         }
     }
+    std.debug.print("\n", .{});
 
     var total_size: u64 = 0;
     for (file_list.items) |info| {
@@ -143,8 +149,11 @@ pub fn main() !void {
             files[i].hash = hash_buf;
 
             done_hashes_count += 1;
+            const percentage: f64 = @intToFloat(f64, done_hashes_count) * 100.0 / @intToFloat(f64, same_size_count);
+            std.debug.print("\rSumy kontrolne {d}/{d} ({d:.2}%)", .{ done_hashes_count, same_size_count, percentage });
         }
     }
+    std.debug.print("\n", .{});
 
     var same_hash_count: u64 = 0;
     {
