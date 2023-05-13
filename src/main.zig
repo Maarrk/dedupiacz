@@ -11,6 +11,7 @@ const FileInfo = struct {
     size: u64,
     duplicate_size: bool = false,
     hash: ?[HASH_LEN]u8 = null,
+    duplicate_hash: bool = false,
 
     fn size_desc(context: void, a: FileInfo, b: FileInfo) bool {
         _ = context;
@@ -96,57 +97,86 @@ pub fn main() !void {
     for (file_list.items) |info| {
         total_size += info.size;
     }
-    std.debug.print("Znaleziono {d} plików, całkowity rozmiar {s}\n", .{ file_list.items.len, try format_size(total_size) });
+    std.debug.print("Znaleziono {d} plików, całkowity rozmiar {s}\n", .{ file_list.items.len, format_size(total_size) });
 
     std.sort.sort(FileInfo, file_list.items, {}, FileInfo.size_desc);
-    // for (file_list.items) |info| {
-    //     std.debug.print("{d}\t{s}\n", .{ info.size, info.full_path });
-    // }
     const files = file_list.items; // Only edit specific fields from now on
 
     var same_size_count: u64 = 0;
-    if (files.len >= 2) {
-        // Check first and last file
-        if (files[0].size == files[1].size) {
-            same_size_count += 1;
-            files[0].duplicate_size = true;
-        }
-        if (files[files.len - 2].size == files[files.len - 1].size) {
-            same_size_count += 1;
-            files[files.len - 1].duplicate_size = true;
-        }
+    {
         // Check with either neighbor (to correctly count two and three consecutive files correctly, you have to check three per iteration)
-        var i: usize = 1;
-        while (i < files.len - 1) : (i += 1) {
-            const prev_size = files[i - 1].size;
+        var i: usize = 0;
+        while (i < files.len) : (i += 1) {
             const size = files[i].size;
-            const next_size = files[i + 1].size;
-
-            if (prev_size == size or size == next_size) {
-                same_size_count += 1;
-                files[i].duplicate_size = true;
+            if (i > 0) {
+                if (files[i - 1].size == size) {
+                    same_size_count += 1;
+                    files[i].duplicate_size = true;
+                    continue; // Don't count the middle file twice
+                }
+            }
+            if (i < files.len - 1) {
+                if (files[i + 1].size == size) {
+                    same_size_count += 1;
+                    files[i].duplicate_size = true;
+                }
             }
         }
     }
     std.debug.print("{d} plików ma ten sam rozmiar\n", .{same_size_count});
 
     var done_hashes_count: u64 = 0;
-    for (files) |info| {
+    for (files) |info, i| {
         if (info.duplicate_size) {
-            // TODO: this block
-            // Initialize MD5
-            // Open file
-            // Hash all bytes from file
-            // Save hash
+            var hash = std.crypto.hash.Md5.init(.{});
+            std.debug.print("{s}\n", .{&info.full_path});
+            var file = try std.fs.openFileAbsoluteZ(@ptrCast([*:0]const u8, &info.full_path), .{});
+            defer file.close();
+            var buf_reader = std.io.bufferedReader(file.reader());
+            var in_stream = buf_reader.reader();
+
+            var buf: [1024]u8 = undefined;
+            while (try in_stream.read(&buf) > 0) {
+                hash.update(&buf);
+            }
+            var hash_buf: [16]u8 = undefined;
+            hash.final(&hash_buf);
+            files[i].hash = hash_buf;
 
             done_hashes_count += 1;
         }
     }
 
-    // TODO: Compare hashes and output duplicates
+    {
+        var i: usize = 0;
+        while (i < files.len) : (i += 1) {
+            if (files[i].hash) |hash| {
+                if (i > 0) {
+                    if (files[i - 1].hash) |prev_hash| {
+                        if (std.mem.eql(u8, &hash, &prev_hash)) {
+                            files[i].duplicate_hash = true;
+                            continue; // Skip comparison with next
+                        }
+                    }
+                }
+
+                if (i < files.len - 1) {
+                    if (files[i + 1].hash) |next_hash| {
+                        if (std.mem.eql(u8, &hash, &next_hash)) {
+                            files[i].duplicate_hash = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (file_list.items) |info| {
+        std.debug.print("{any} {s}\t{s}\t{any}\n", .{ info.duplicate_hash, format_size(info.size), info.full_path, info.hash });
+    }
 }
 
-fn format_size(size: u64) std.fmt.BufPrintError![5]u8 {
+fn format_size(size: u64) [5]u8 {
     const suffixes = [_]u8{ 'B', 'K', 'M', 'G', 'T', 'P', 'E' };
     const kibi: f64 = 1024;
     var size_left = @intToFloat(f64, size);
@@ -158,13 +188,13 @@ fn format_size(size: u64) std.fmt.BufPrintError![5]u8 {
 
     var result = [_]u8{' '} ** 5;
     if (size_left < 10) {
-        _ = try std.fmt.bufPrint(&result, "{d:.2}{c}", .{ size_left, suffixes[suffix_index] });
+        _ = std.fmt.bufPrint(&result, "{d:.2}{c}", .{ size_left, suffixes[suffix_index] }) catch unreachable;
     } else if (size_left < 100) {
-        _ = try std.fmt.bufPrint(&result, "{d:.1}{c}", .{ size_left, suffixes[suffix_index] });
+        _ = std.fmt.bufPrint(&result, "{d:.1}{c}", .{ size_left, suffixes[suffix_index] }) catch unreachable;
     } else if (size_left < 1000) {
-        _ = try std.fmt.bufPrint(&result, " {d}{c}", .{ @floor(size_left), suffixes[suffix_index] });
+        _ = std.fmt.bufPrint(&result, " {d}{c}", .{ @floor(size_left), suffixes[suffix_index] }) catch unreachable;
     } else { // 1000 to 1023
-        _ = try std.fmt.bufPrint(&result, "{d}{c}", .{ @floor(size_left), suffixes[suffix_index] });
+        _ = std.fmt.bufPrint(&result, "{d}{c}", .{ @floor(size_left), suffixes[suffix_index] }) catch unreachable;
     }
 
     return result;
