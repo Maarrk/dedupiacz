@@ -9,6 +9,7 @@ const HASH_LEN: comptime_int = 16;
 const FileInfo = struct {
     full_path: [MAX_PATH_LEN]u8 = [_]u8{0} ** MAX_PATH_LEN,
     size: u64,
+    duplicate_size: bool = false,
     hash: ?[HASH_LEN]u8 = null,
 
     fn size_desc(context: void, a: FileInfo, b: FileInfo) bool {
@@ -91,8 +92,80 @@ pub fn main() !void {
         }
     }
 
-    std.sort.sort(FileInfo, file_list.items, {}, FileInfo.size_desc);
+    var total_size: u64 = 0;
     for (file_list.items) |info| {
-        std.debug.print("{d}\t{s}\n", .{info.size, info.full_path});
+        total_size += info.size;
     }
+    std.debug.print("Znaleziono {d} plików, całkowity rozmiar {s}\n", .{ file_list.items.len, try format_size(total_size) });
+
+    std.sort.sort(FileInfo, file_list.items, {}, FileInfo.size_desc);
+    // for (file_list.items) |info| {
+    //     std.debug.print("{d}\t{s}\n", .{ info.size, info.full_path });
+    // }
+    const files = file_list.items; // Only edit specific fields from now on
+
+    var same_size_count: u64 = 0;
+    if (files.len >= 2) {
+        // Check first and last file
+        if (files[0].size == files[1].size) {
+            same_size_count += 1;
+            files[0].duplicate_size = true;
+        }
+        if (files[files.len - 2].size == files[files.len - 1].size) {
+            same_size_count += 1;
+            files[files.len - 1].duplicate_size = true;
+        }
+        // Check with either neighbor (to correctly count two and three consecutive files correctly, you have to check three per iteration)
+        var i: usize = 1;
+        while (i < files.len - 1) : (i += 1) {
+            const prev_size = files[i - 1].size;
+            const size = files[i].size;
+            const next_size = files[i + 1].size;
+
+            if (prev_size == size or size == next_size) {
+                same_size_count += 1;
+                files[i].duplicate_size = true;
+            }
+        }
+    }
+    std.debug.print("{d} plików ma ten sam rozmiar\n", .{same_size_count});
+
+    var done_hashes_count: u64 = 0;
+    for (files) |info| {
+        if (info.duplicate_size) {
+            // TODO: this block
+            // Initialize MD5
+            // Open file
+            // Hash all bytes from file
+            // Save hash
+
+            done_hashes_count += 1;
+        }
+    }
+
+    // TODO: Compare hashes and output duplicates
+}
+
+fn format_size(size: u64) std.fmt.BufPrintError![5]u8 {
+    const suffixes = [_]u8{ 'B', 'K', 'M', 'G', 'T', 'P', 'E' };
+    const kibi: f64 = 1024;
+    var size_left = @intToFloat(f64, size);
+    var suffix_index: usize = 0;
+    while (size_left >= kibi) {
+        suffix_index += 1;
+        size_left /= kibi;
+    }
+
+    var result = [_]u8{' '} ** 5;
+    if (size_left < 10) {
+        _ = try std.fmt.bufPrint(&result, "{d:.2}{c}", .{ size_left, suffixes[suffix_index] });
+    } else if (size_left < 100) {
+        _ = try std.fmt.bufPrint(&result, "{d:.1}{c}", .{ size_left, suffixes[suffix_index] });
+    } else if (size_left < 1000) {
+        _ = try std.fmt.bufPrint(&result, " {d}{c}", .{ @floor(size_left), suffixes[suffix_index] });
+    } else { // 1000 to 1023
+        _ = try std.fmt.bufPrint(&result, "{d}{c}", .{ @floor(size_left), suffixes[suffix_index] });
+    }
+
+    return result;
 }
