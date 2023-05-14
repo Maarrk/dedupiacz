@@ -109,29 +109,30 @@ pub fn main() !void {
     const files = file_list.items; // Only edit specific fields from now on
 
     var same_size_count: u64 = 0;
+    var same_size_size: u64 = 0;
     {
         // Check with either neighbor (to correctly count two and three consecutive files correctly, you have to check three per iteration)
         var i: usize = 0;
         while (i < files.len) : (i += 1) {
             const size = files[i].size;
-            if (i > 0) {
-                if (files[i - 1].size == size) {
-                    same_size_count += 1;
-                    files[i].duplicate_size = true;
-                    continue; // Don't count the middle file twice
-                }
+            if (i > 0 and files[i - 1].size == size) {
+                same_size_count += 1;
+                same_size_size += files[i].size;
+                files[i].duplicate_size = true;
+                continue; // Don't count the middle file twice
             }
-            if (i < files.len - 1) {
-                if (files[i + 1].size == size) {
-                    same_size_count += 1;
-                    files[i].duplicate_size = true;
-                }
+            if (i < files.len - 1 and files[i + 1].size == size) {
+                same_size_count += 1;
+                same_size_size += files[i].size;
+                files[i].duplicate_size = true;
             }
         }
     }
     std.debug.print("{d} plików ma ten sam rozmiar\n", .{same_size_count});
 
+    const hash_start_time = std.time.timestamp();
     var done_hashes_count: u64 = 0;
+    var done_hashes_size: u64 = 0;
     for (files) |info, i| {
         if (info.duplicate_size) {
             var hash = std.crypto.hash.Md5.init(.{});
@@ -148,9 +149,15 @@ pub fn main() !void {
             hash.final(&hash_buf);
             files[i].hash = hash_buf;
 
+            const time_elapsed = std.time.timestamp() - hash_start_time;
             done_hashes_count += 1;
-            const percentage: f64 = @intToFloat(f64, done_hashes_count) * 100.0 / @intToFloat(f64, same_size_count);
-            std.debug.print("\rSumy kontrolne {d}/{d} ({d:.2}%)", .{ done_hashes_count, same_size_count, percentage });
+            const count_part: f64 = @intToFloat(f64, done_hashes_count) / @intToFloat(f64, same_size_count);
+            const count_eta: u64 = std.math.absCast(@floatToInt(i64, @intToFloat(f64, time_elapsed) / count_part));
+            done_hashes_size += files[i].size;
+            const size_part: f64 = @intToFloat(f64, done_hashes_size) / @intToFloat(f64, same_size_size);
+            const size_eta: u64 = std.math.absCast(@floatToInt(i64, @intToFloat(f64, time_elapsed) / size_part));
+
+            std.debug.print("\rSumy kontrolne {d}/{d} ({d:.2}% ETA: {s}), {s}/{s} ({d:.2}% ETA: {s})", .{ done_hashes_count, same_size_count, count_part * 100, format_time(count_eta), format_size(done_hashes_size), format_size(same_size_size), size_part * 100, format_time(size_eta) });
         }
     }
     std.debug.print("\n", .{});
@@ -227,6 +234,32 @@ fn format_size(size: u64) [5]u8 {
         _ = std.fmt.bufPrint(&result, " {d}{c}", .{ @floor(size_left), suffixes[suffix_index] }) catch unreachable;
     } else { // 1000 to 1023
         _ = std.fmt.bufPrint(&result, "{d}{c}", .{ @floor(size_left), suffixes[suffix_index] }) catch unreachable;
+    }
+
+    return result;
+}
+
+fn format_time(time_seconds: u64) [6]u8 {
+    var t = time_seconds;
+    const seconds = t % 60;
+    t /= 60;
+    const minutes = t % 60;
+    t /= 60;
+    const hours = t % 24;
+    t /= 24;
+    const days = t;
+
+    var result = [_]u8{' '} ** 6;
+    if (hours == 0 and days == 0) {
+        _ = std.fmt.bufPrint(&result, "{d: >2}m{d: >2}s", .{ minutes, seconds }) catch unreachable;
+    } else if (days == 0) {
+        _ = std.fmt.bufPrint(&result, "{d: >2}h{d: >2}m", .{ hours, minutes }) catch unreachable;
+    } else if (days <= 99) {
+        _ = std.fmt.bufPrint(&result, "{d: >2}d{d: >2}h", .{ days, hours }) catch unreachable;
+    } else if (days <= 99999) {
+        _ = std.fmt.bufPrint(&result, "{d: >5}d", .{days}) catch unreachable;
+    } else {
+        _ = std.fmt.bufPrint(&result, "w ch*j", .{}) catch unreachable;
     }
 
     return result;
