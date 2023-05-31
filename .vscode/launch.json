@@ -4,12 +4,28 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
+
         {
             "name": "debug",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/zig-out/bin/dedupiacz",
             "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "preLaunchTask": "build",
+            "windows": {
+                "type": "cppvsdbg",
+                "console": "integratedTerminal",
+            }
+        },
+        {
+            "name": "debug CzarPom",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/zig-out/bin/dedupiacz",
+            "args": ["C:/CzarnoPomaranczowy"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],

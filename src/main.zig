@@ -133,7 +133,7 @@ pub fn main() !void {
     const hash_start_time = std.time.timestamp();
     var done_hashes_count: u64 = 0;
     var done_hashes_size: u64 = 0;
-    for (files) |info, i| {
+    for (files, 0..) |info, i| {
         if (info.duplicate_size) {
             std.debug.print("przetwarzanie pliku {s}", .{format_size(info.size)});
             var hash = std.crypto.hash.Md5.init(.{});
