@@ -12,15 +12,15 @@ const HASH_LEN: comptime_int = 16;
 
 const TreeNode = struct {
     name: [MAX_NAME_LEN]u8 = [_]u8{0} ** MAX_NAME_LEN,
-    parent: ?*TreeNode, // can only be null at the root node
+    parent_index: ?usize, // can only be null at the root node
     size: u64 = 0,
     hash: ?[HASH_LEN]u8 = null,
     duplicate_hash: bool = false,
     info: NodeInfo,
 
     /// Use init_root, init_dir or init_file instead, to force passing correct arguments
-    fn _init(parent: *TreeNode, kind: NodeKind, name: []const u8) !TreeNode {
-        switch (parent.info) {
+    fn _init(nodes: []TreeNode, parent_index: usize, kind: NodeKind, name: []const u8) !TreeNode {
+        switch (nodes[parent_index].info) {
             .dir => |*info| {
                 switch (kind) {
                     .dir => info.dir_children += 1,
@@ -30,7 +30,7 @@ const TreeNode = struct {
             .file => return error.NonDirectoryParent,
         }
 
-        var self = TreeNode{ .parent = parent, .info = switch (kind) {
+        var self = TreeNode{ .parent_index = parent_index, .info = switch (kind) {
             .dir => NodeInfo{ .dir = DirInfo{} },
             .file => NodeInfo{ .file = FileInfo{} },
         } };
@@ -41,17 +41,17 @@ const TreeNode = struct {
 
     fn init_root() TreeNode {
         return TreeNode{
-            .parent = null,
+            .parent_index = null,
             .info = NodeInfo{ .dir = DirInfo{} },
         };
     }
 
-    fn init_dir(parent: *TreeNode, name: []const u8) !TreeNode {
-        return TreeNode._init(parent, .dir, name);
+    fn init_dir(nodes: []TreeNode, parent_index: usize, name: []const u8) !TreeNode {
+        return TreeNode._init(nodes, parent_index, .dir, name);
     }
 
-    fn init_file(parent: *TreeNode, name: []const u8, size: u64) !TreeNode {
-        var self = try TreeNode._init(parent, .file, name);
+    fn init_file(nodes: []TreeNode, parent_index: usize, name: []const u8, size: u64) !TreeNode {
+        var self = try TreeNode._init(nodes, parent_index, .file, name);
         self.size = size;
         return self;
     }
@@ -62,8 +62,8 @@ const TreeNode = struct {
         for (nodes, 0..) |_, i| {
             const i_rev = nodes.len - 1 - i;
             const node = nodes[i_rev];
-            if (node.parent) |p| {
-                p.size += node.size;
+            if (node.parent_index) |p| {
+                nodes[p].size += node.size;
             }
         }
     }
@@ -95,11 +95,13 @@ const TreeNode = struct {
         }
     }
 
-    fn full_path(self: TreeNode, out_buffer: []u8) ![]u8 {
+    fn full_path(self: *TreeNode, nodes: []TreeNode, out_buffer: []u8) ![]u8 {
         var path_len: usize = 0;
-        var current_node: ?*TreeNode = @constCast(&self);
-        while (current_node) |node| { // iterate until we get a null (root node)
+        const offset = @ptrToInt(self) - @ptrToInt(&nodes[0]);
+        var current_index: ?usize = @divExact(offset, @sizeOf(TreeNode));
+        while (current_index) |i| { // iterate until we get a null (root node)
             // write the name in reverse
+            const node = nodes[i];
             const name_slice = std.mem.sliceTo(&(node.name), 0);
             const new_end = path_len + name_slice.len;
             if (new_end > out_buffer.len) return error.NameTooLong;
@@ -111,7 +113,7 @@ const TreeNode = struct {
             out_buffer[path_len] = std.fs.path.sep;
             path_len += 1;
 
-            current_node = node.parent;
+            current_index = node.parent_index;
         }
         if (builtin.os.tag == .windows) {
             path_len -= 2; // strip backslash before and after root node
@@ -124,41 +126,43 @@ const TreeNode = struct {
 };
 
 test "absolute path of a node" {
-    var root = TreeNode.init_root();
-    var drive = try TreeNode.init_dir(&root, "C:");
-    var dir = try TreeNode.init_dir(&drive, "foo");
-    var file = try TreeNode.init_file(&dir, "bar.txt", 1);
+    var nodes: [4]TreeNode = undefined;
+    nodes[0] = TreeNode.init_root();
+    nodes[1] = try TreeNode.init_dir(&nodes, 0, "C:");
+    nodes[2] = try TreeNode.init_dir(&nodes, 1, "foo");
+    nodes[3] = try TreeNode.init_file(&nodes, 2, "bar.txt", 1);
 
     var path_buffer: [MAX_PATH_LEN]u8 = undefined;
-    const full_path = try file.full_path(&path_buffer);
+    const full_path = try TreeNode.full_path(&nodes[3], &nodes, &path_buffer);
     const expected_path = if (builtin.os.tag == .windows) "C:\\foo\\bar.txt" else "/C:/foo/bar.txt";
 
     try expectEqualStrings(expected_path, full_path);
 }
 
 test "counting children" {
-    var root = TreeNode.init_root();
-    var drive = try TreeNode.init_dir(&root, "C:");
-    var dir = try TreeNode.init_dir(&drive, "foo");
-    _ = try TreeNode.init_file(&dir, "bar.txt", 1);
-    _ = try TreeNode.init_file(&dir, "baz.zip", 2);
-    _ = try TreeNode.init_file(&drive, "fubar", 4);
+    var nodes: [6]TreeNode = undefined;
+    nodes[0] = TreeNode.init_root();
+    nodes[1] = try TreeNode.init_dir(&nodes, 0, "C:"); // drive
+    nodes[2] = try TreeNode.init_dir(&nodes, 1, "foo"); // dir
+    nodes[3] = try TreeNode.init_file(&nodes, 2, "bar.txt", 1);
+    nodes[4] = try TreeNode.init_file(&nodes, 2, "baz.zip", 2);
+    nodes[5] = try TreeNode.init_file(&nodes, 1, "fubar", 4);
 
-    switch (root.info) {
+    switch (nodes[0].info) {
         .dir => |info| {
             try expectEqual(@as(u64, 1), info.dir_children);
             try expectEqual(@as(u64, 0), info.file_children);
         },
         .file => unreachable,
     }
-    switch (drive.info) {
+    switch (nodes[1].info) {
         .dir => |info| {
             try expectEqual(@as(u64, 1), info.dir_children);
             try expectEqual(@as(u64, 1), info.file_children);
         },
         .file => unreachable,
     }
-    switch (dir.info) {
+    switch (nodes[2].info) {
         .dir => |info| {
             try expectEqual(@as(u64, 0), info.dir_children);
             try expectEqual(@as(u64, 2), info.file_children);
@@ -170,11 +174,11 @@ test "counting children" {
 test "directory sizes" {
     var nodes: [6]TreeNode = undefined;
     nodes[0] = TreeNode.init_root();
-    nodes[1] = try TreeNode.init_dir(&nodes[0], "C:"); // drive
-    nodes[2] = try TreeNode.init_dir(&nodes[1], "foo"); // dir
-    nodes[3] = try TreeNode.init_file(&nodes[2], "bar.txt", 1);
-    nodes[4] = try TreeNode.init_file(&nodes[2], "baz.zip", 2);
-    nodes[5] = try TreeNode.init_file(&nodes[1], "fubar", 4);
+    nodes[1] = try TreeNode.init_dir(&nodes, 0, "C:"); // drive
+    nodes[2] = try TreeNode.init_dir(&nodes, 1, "foo"); // dir
+    nodes[3] = try TreeNode.init_file(&nodes, 2, "bar.txt", 1);
+    nodes[4] = try TreeNode.init_file(&nodes, 2, "baz.zip", 2);
+    nodes[5] = try TreeNode.init_file(&nodes, 1, "fubar", 4);
 
     TreeNode.sum_file_sizes(nodes[0..]);
 
