@@ -3,17 +3,70 @@ const builtin = @import("builtin");
 const clap = @import("clap");
 // const clap = @import("../libs/zig-clap/clap.zig"); // For ZLS completions, not allowed when building
 
+const expectEqual = std.testing.expectEqual;
+const expectEqualStrings = std.testing.expectEqualStrings;
+
+const MAX_PATH_LEN: comptime_int = 512;
 const MAX_NAME_LEN: comptime_int = 64;
 const HASH_LEN: comptime_int = 16;
 
 const TreeNode = struct {
     name: [MAX_NAME_LEN]u8 = [_]u8{0} ** MAX_NAME_LEN,
-    parent: *TreeNode, // For convenience this isn't optional pointer, I'll detect root node otherwise
-    size: u64,
+    parent: ?*TreeNode, // can only be null at the root node
+    size: u64 = 0,
     hash: ?[HASH_LEN]u8 = null,
-    md5: ?std.crypto.hash.Md5,
     duplicate_hash: bool = false,
     info: NodeInfo,
+
+    /// Use init_root, init_dir or init_file instead, to force passing correct arguments
+    fn _init(parent: *TreeNode, kind: NodeKind, name: []const u8) !TreeNode {
+        switch (parent.info) {
+            .dir => |*info| {
+                switch (kind) {
+                    .dir => info.dir_children += 1,
+                    .file => info.file_children += 1,
+                }
+            },
+            .file => return error.NonDirectoryParent,
+        }
+
+        var self = TreeNode{ .parent = parent, .info = switch (kind) {
+            .dir => NodeInfo{ .dir = DirInfo{} },
+            .file => NodeInfo{ .file = FileInfo{} },
+        } };
+        if (name.len > self.name.len) return error.NameTooLong;
+        @memcpy(self.name[0..name.len], name);
+        return self;
+    }
+
+    fn init_root() TreeNode {
+        return TreeNode{
+            .parent = null,
+            .info = NodeInfo{ .dir = DirInfo{} },
+        };
+    }
+
+    fn init_dir(parent: *TreeNode, name: []const u8) !TreeNode {
+        return TreeNode._init(parent, .dir, name);
+    }
+
+    fn init_file(parent: *TreeNode, name: []const u8, size: u64) !TreeNode {
+        var self = try TreeNode._init(parent, .file, name);
+        self.size = size;
+        return self;
+    }
+
+    /// Update every directory size with sum of size of its children.
+    /// The `nodes` list must be sorted so that all children are after their parent
+    fn sum_file_sizes(nodes: []TreeNode) void {
+        for (nodes, 0..) |_, i| {
+            const i_rev = nodes.len - 1 - i;
+            const node = nodes[i_rev];
+            if (node.parent) |p| {
+                p.size += node.size;
+            }
+        }
+    }
 
     /// Sort descending by size
     fn size_desc(context: void, a: *TreeNode, b: *TreeNode) bool {
@@ -41,17 +94,110 @@ const TreeNode = struct {
             }
         }
     }
+
+    fn full_path(self: TreeNode, out_buffer: []u8) ![]u8 {
+        var path_len: usize = 0;
+        var current_node: ?*TreeNode = @constCast(&self);
+        while (current_node) |node| { // iterate until we get a null (root node)
+            // write the name in reverse
+            const name_slice = std.mem.sliceTo(&(node.name), 0);
+            const new_end = path_len + name_slice.len;
+            if (new_end > out_buffer.len) return error.NameTooLong;
+            @memcpy(out_buffer[path_len..new_end], name_slice);
+            std.mem.reverse(u8, out_buffer[path_len..new_end]);
+            path_len = new_end;
+
+            if (path_len + 1 > out_buffer.len) return error.NameTooLong;
+            out_buffer[path_len] = std.fs.path.sep;
+            path_len += 1;
+
+            current_node = node.parent;
+        }
+        if (builtin.os.tag == .windows) {
+            path_len -= 2; // strip backslash before and after root node
+        } else {
+            path_len -= 1; // strip slash before root node (so path starts with slash)
+        }
+        std.mem.reverse(u8, out_buffer[0..path_len]); // reverse back the name to go from root
+        return out_buffer[0..path_len];
+    }
 };
 
-const NodeInfo = union(enum) {
+test "absolute path of a node" {
+    var root = TreeNode.init_root();
+    var drive = try TreeNode.init_dir(&root, "C:");
+    var dir = try TreeNode.init_dir(&drive, "foo");
+    var file = try TreeNode.init_file(&dir, "bar.txt", 1);
+
+    var path_buffer: [MAX_PATH_LEN]u8 = undefined;
+    const full_path = try file.full_path(&path_buffer);
+    const expected_path = if (builtin.os.tag == .windows) "C:\\foo\\bar.txt" else "/C:/foo/bar.txt";
+
+    try expectEqualStrings(expected_path, full_path);
+}
+
+test "counting children" {
+    var root = TreeNode.init_root();
+    var drive = try TreeNode.init_dir(&root, "C:");
+    var dir = try TreeNode.init_dir(&drive, "foo");
+    _ = try TreeNode.init_file(&dir, "bar.txt", 1);
+    _ = try TreeNode.init_file(&dir, "baz.zip", 2);
+    _ = try TreeNode.init_file(&drive, "fubar", 4);
+
+    switch (root.info) {
+        .dir => |info| {
+            try expectEqual(@as(u64, 1), info.dir_children);
+            try expectEqual(@as(u64, 0), info.file_children);
+        },
+        .file => unreachable,
+    }
+    switch (drive.info) {
+        .dir => |info| {
+            try expectEqual(@as(u64, 1), info.dir_children);
+            try expectEqual(@as(u64, 1), info.file_children);
+        },
+        .file => unreachable,
+    }
+    switch (dir.info) {
+        .dir => |info| {
+            try expectEqual(@as(u64, 0), info.dir_children);
+            try expectEqual(@as(u64, 2), info.file_children);
+        },
+        .file => unreachable,
+    }
+}
+
+test "directory sizes" {
+    var nodes: [6]TreeNode = undefined;
+    nodes[0] = TreeNode.init_root();
+    nodes[1] = try TreeNode.init_dir(&nodes[0], "C:"); // drive
+    nodes[2] = try TreeNode.init_dir(&nodes[1], "foo"); // dir
+    nodes[3] = try TreeNode.init_file(&nodes[2], "bar.txt", 1);
+    nodes[4] = try TreeNode.init_file(&nodes[2], "baz.zip", 2);
+    nodes[5] = try TreeNode.init_file(&nodes[1], "fubar", 4);
+
+    TreeNode.sum_file_sizes(nodes[0..]);
+
+    try expectEqual(@as(u64, 7), nodes[0].size);
+    try expectEqual(@as(u64, 7), nodes[1].size);
+    try expectEqual(@as(u64, 3), nodes[2].size);
+}
+
+const NodeKind = enum {
+    dir,
+    file,
+};
+
+const NodeInfo = union(NodeKind) {
     dir: DirInfo,
     file: FileInfo,
 };
 
 const DirInfo = struct {
-    dir_children: u64,
-    file_children: u64,
-    hashed_children: u64,
+    dir_children: u64 = 0,
+    file_children: u64 = 0,
+    hashed_children: u64 = 0,
+    md5: ?*std.crypto.hash.Md5 = null,
 };
 
 const FileInfo = struct {
@@ -132,26 +278,25 @@ pub fn main() !void {
     // Sort by size descending
     // Print out all nodes whose parent isn't duplicate
 
-    var realpath_set = std.StringHashMap(void).init(alloc);
-    defer realpath_set.deinit();
+    var tree_list = std.ArrayList(TreeNode).init(alloc);
+    defer tree_list.deinit();
+
+    {
+        const root_node = TreeNode{
+            .parent = @ptrCast(*TreeNode, null),
+            .info = NodeInfo{.dir},
+        };
+        tree_list.append(root_node);
+    }
+
     const realpath_buf: []u8 = try alloc.alloc(u8, MAX_PATH_LEN);
     defer alloc.free(realpath_buf);
 
     var file_count: u64 = 0;
-    var file_list = std.ArrayList(FileInfo).init(alloc);
-    defer file_list.deinit();
 
     // to match the types, cast array literal to "[]T - pointer to runtime-known number of items", hence the need for &
     var search_paths = if (res.positionals.len > 0) res.positionals else @as([]const []const u8, &[_][]const u8{"."});
     for (search_paths) |path| {
-        const realpath = try std.fs.cwd().realpath(path, realpath_buf);
-        // FIXME: Doesn't detect duplication if one contains the other
-        if (realpath_set.contains(realpath)) {
-            std.debug.print("Błąd: ścieżka '{s}' podana wielokrotnie (argument: '{s}')", .{ realpath, path });
-            return;
-        }
-        try realpath_set.put(realpath, {});
-
         var walker = try (try std.fs.cwd().openIterableDir(path, .{})).walk(alloc);
         defer walker.deinit();
 
@@ -170,118 +315,119 @@ pub fn main() !void {
                 .size = stat.size,
             };
             std.mem.copy(u8, &info.full_path, file_realpath);
-            try file_list.append(info);
         }
     }
     std.debug.print("\n", .{});
 
     var total_size: u64 = 0;
-    for (file_list.items) |info| {
-        total_size += info.size;
-    }
-    std.debug.print("Znaleziono {d} plików, całkowity rozmiar {s}\n", .{ file_list.items.len, format_size(total_size) });
-
-    std.sort.sort(FileInfo, file_list.items, {}, FileInfo.size_desc);
-    const files = file_list.items; // Only edit specific fields from now on
-
-    var same_size_count: u64 = 0;
-    var same_size_size: u64 = 0;
-    {
-        // Check with either neighbor (to correctly count two and three consecutive files correctly, you have to check three per iteration)
-        var i: usize = 0;
-        while (i < files.len) : (i += 1) {
-            const size = files[i].size;
-            if (i > 0 and files[i - 1].size == size) {
-                same_size_count += 1;
-                same_size_size += files[i].size;
-                files[i].duplicate_size = true;
-                continue; // Don't count the middle file twice
-            }
-            if (i < files.len - 1 and files[i + 1].size == size) {
-                same_size_count += 1;
-                same_size_size += files[i].size;
-                files[i].duplicate_size = true;
-            }
+    for (tree_list.items) |node| {
+        if (node.info == .file) {
+            total_size += node.size;
         }
     }
-    std.debug.print("{d} plików ma ten sam rozmiar\n", .{same_size_count});
+    std.debug.print("Znaleziono {d} plików, całkowity rozmiar {s}\n", .{ file_count, format_size(total_size) });
 
-    const hash_start_time = std.time.timestamp();
-    var done_hashes_count: u64 = 0;
-    var done_hashes_size: u64 = 0;
-    for (files, 0..) |info, i| {
-        if (info.duplicate_size) {
-            std.debug.print("przetwarzanie pliku {s}", .{format_size(info.size)});
-            var hash = std.crypto.hash.Md5.init(.{});
-            var file = try std.fs.openFileAbsoluteZ(@ptrCast([*:0]const u8, &info.full_path), .{});
-            defer file.close();
-            var buf_reader = std.io.bufferedReader(file.reader());
-            var in_stream = buf_reader.reader();
+    const nodes = tree_list.items;
+    _ = nodes; // Only edit specific fields from now on
 
-            var buf: [1024]u8 = undefined;
-            while (try in_stream.read(&buf) > 0) {
-                hash.update(&buf);
-            }
-            var hash_buf: [16]u8 = undefined;
-            hash.final(&hash_buf);
-            files[i].hash = hash_buf;
+    // var same_size_count: u64 = 0;
+    // var same_size_size: u64 = 0;
+    // {
+    //     // Check with either neighbor (to correctly count two and three consecutive files correctly, you have to check three per iteration)
+    //     var i: usize = 0;
+    //     while (i < files.len) : (i += 1) {
+    //         const size = files[i].size;
+    //         if (i > 0 and files[i - 1].size == size) {
+    //             same_size_count += 1;
+    //             same_size_size += files[i].size;
+    //             files[i].duplicate_size = true;
+    //             continue; // Don't count the middle file twice
+    //         }
+    //         if (i < files.len - 1 and files[i + 1].size == size) {
+    //             same_size_count += 1;
+    //             same_size_size += files[i].size;
+    //             files[i].duplicate_size = true;
+    //         }
+    //     }
+    // }
+    // std.debug.print("{d} plików ma ten sam rozmiar\n", .{same_size_count});
 
-            const time_elapsed = std.math.absCast(std.time.timestamp() - hash_start_time);
-            done_hashes_count += 1;
-            const count_part: f64 = @intToFloat(f64, done_hashes_count) / @intToFloat(f64, same_size_count);
-            const count_eta: u64 = std.math.absCast(@floatToInt(i64, @intToFloat(f64, time_elapsed) / count_part * (1 - count_part)));
-            done_hashes_size += files[i].size;
-            const size_part: f64 = @intToFloat(f64, done_hashes_size) / @intToFloat(f64, same_size_size);
-            const size_eta: u64 = std.math.absCast(@floatToInt(i64, @intToFloat(f64, time_elapsed) / size_part * (1 - size_part)));
+    // const hash_start_time = std.time.timestamp();
+    // var done_hashes_count: u64 = 0;
+    // var done_hashes_size: u64 = 0;
+    // for (files, 0..) |info, i| {
+    //     if (info.duplicate_size) {
+    //         std.debug.print("przetwarzanie pliku {s}", .{format_size(info.size)});
+    //         var hash = std.crypto.hash.Md5.init(.{});
+    //         var file = try std.fs.openFileAbsoluteZ(@ptrCast([*:0]const u8, &info.full_path), .{});
+    //         defer file.close();
+    //         var buf_reader = std.io.bufferedReader(file.reader());
+    //         var in_stream = buf_reader.reader();
 
-            std.debug.print("\r{s}: {d}/{d} ({d:.2}% ETA: {s}), {s}/{s} ({d:.2}% ETA: {s}), ", .{ format_time(time_elapsed), done_hashes_count, same_size_count, count_part * 100, format_time(count_eta), format_size(done_hashes_size), format_size(same_size_size), size_part * 100, format_time(size_eta) });
-        }
-    }
-    std.debug.print("{s}\n", .{[_]u8{' '} ** 25}); // overwrite the opened file text from loop
+    //         var buf: [1024]u8 = undefined;
+    //         while (try in_stream.read(&buf) > 0) {
+    //             hash.update(&buf);
+    //         }
+    //         var hash_buf: [16]u8 = undefined;
+    //         hash.final(&hash_buf);
+    //         files[i].hash = hash_buf;
 
-    var same_hash_count: u64 = 0;
-    {
-        var i: usize = 0;
-        while (i < files.len) : (i += 1) {
-            if (files[i].hash) |hash| {
-                if (i > 0) {
-                    if (files[i - 1].hash) |prev_hash| {
-                        if (std.mem.eql(u8, &hash, &prev_hash)) {
-                            files[i].duplicate_hash = true;
-                            same_hash_count += 1;
-                            continue; // Skip comparison with next
-                        }
-                    }
-                }
+    //         const time_elapsed = std.math.absCast(std.time.timestamp() - hash_start_time);
+    //         done_hashes_count += 1;
+    //         const count_part: f64 = @intToFloat(f64, done_hashes_count) / @intToFloat(f64, same_size_count);
+    //         const count_eta: u64 = std.math.absCast(@floatToInt(i64, @intToFloat(f64, time_elapsed) / count_part * (1 - count_part)));
+    //         done_hashes_size += files[i].size;
+    //         const size_part: f64 = @intToFloat(f64, done_hashes_size) / @intToFloat(f64, same_size_size);
+    //         const size_eta: u64 = std.math.absCast(@floatToInt(i64, @intToFloat(f64, time_elapsed) / size_part * (1 - size_part)));
 
-                if (i < files.len - 1) {
-                    if (files[i + 1].hash) |next_hash| {
-                        if (std.mem.eql(u8, &hash, &next_hash)) {
-                            files[i].duplicate_hash = true;
-                            same_hash_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    std.debug.print("Znaleziono {d} plików o tej samej zawartości\n", .{same_hash_count});
+    //         std.debug.print("\r{s}: {d}/{d} ({d:.2}% ETA: {s}), {s}/{s} ({d:.2}% ETA: {s}), ", .{ format_time(time_elapsed), done_hashes_count, same_size_count, count_part * 100, format_time(count_eta), format_size(done_hashes_size), format_size(same_size_size), size_part * 100, format_time(size_eta) });
+    //     }
+    // }
+    // std.debug.print("{s}\n", .{[_]u8{' '} ** 25}); // overwrite the opened file text from loop
 
-    {
-        var stdout = std.io.getStdOut();
-        var writer = stdout.writer();
-        var last_hash = [_]u8{0} ** HASH_LEN;
-        for (file_list.items) |info| {
-            if (info.duplicate_hash) {
-                const hash = info.hash.?;
-                if (!std.mem.eql(u8, &last_hash, &hash)) {
-                    try writer.print("\n", .{});
-                }
-                try writer.print("{s}\t{s}\n", .{ format_size(info.size), info.full_path });
-                std.mem.copy(u8, &last_hash, &hash);
-            }
-        }
-    }
+    // var same_hash_count: u64 = 0;
+    // {
+    //     var i: usize = 0;
+    //     while (i < files.len) : (i += 1) {
+    //         if (files[i].hash) |hash| {
+    //             if (i > 0) {
+    //                 if (files[i - 1].hash) |prev_hash| {
+    //                     if (std.mem.eql(u8, &hash, &prev_hash)) {
+    //                         files[i].duplicate_hash = true;
+    //                         same_hash_count += 1;
+    //                         continue; // Skip comparison with next
+    //                     }
+    //                 }
+    //             }
+
+    //             if (i < files.len - 1) {
+    //                 if (files[i + 1].hash) |next_hash| {
+    //                     if (std.mem.eql(u8, &hash, &next_hash)) {
+    //                         files[i].duplicate_hash = true;
+    //                         same_hash_count += 1;
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+    // std.debug.print("Znaleziono {d} plików o tej samej zawartości\n", .{same_hash_count});
+
+    // {
+    //     var stdout = std.io.getStdOut();
+    //     var writer = stdout.writer();
+    //     var last_hash = [_]u8{0} ** HASH_LEN;
+    //     for (file_list.items) |info| {
+    //         if (info.duplicate_hash) {
+    //             const hash = info.hash.?;
+    //             if (!std.mem.eql(u8, &last_hash, &hash)) {
+    //                 try writer.print("\n", .{});
+    //             }
+    //             try writer.print("{s}\t{s}\n", .{ format_size(info.size), info.full_path });
+    //             std.mem.copy(u8, &last_hash, &hash);
+    //         }
+    //     }
+    // }
 }
 
 fn format_size(size: u64) [5]u8 {
