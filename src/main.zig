@@ -115,13 +115,46 @@ const TreeNode = struct {
 
             current_index = node.parent_index;
         }
-        if (builtin.os.tag == .windows) {
-            path_len -= 2; // strip backslash before and after root node
-        } else {
-            path_len -= 1; // strip slash before root node (so path starts with slash)
+        if (self.parent_index) |_| { // skip that for root node
+            if (builtin.os.tag == .windows) {
+                path_len -= 2; // strip backslash before and after root node
+            } else {
+                path_len -= 1; // strip slash before root node (so path starts with slash)
+            }
         }
         std.mem.reverse(u8, out_buffer[0..path_len]); // reverse back the name to go from root
         return out_buffer[0..path_len];
+    }
+
+    fn find_path_index(nodes: []TreeNode, path: []const u8) ?usize {
+        if (path.len == 0) { // handle root as a special case
+            if (nodes[0].name[0] == 0) { // string of length 0
+                return 0;
+            } else unreachable; // root node has non-empty name or passed empty node which isn't root
+        }
+
+        var parent_index: usize = 0; // look for a child of root node
+        var current_index: usize = 0; // last matched node
+        var path_iter = std.mem.split(u8, path, std.fs.path.sep_str);
+
+        if (builtin.os.tag != .windows) {
+            try path_iter.next(); // skip leading slash on posix
+        }
+
+        while (path_iter.next()) |name| {
+            while (current_index < nodes.len) {
+                const node = nodes[current_index];
+                if (node.parent_index == parent_index and std.mem.eql(u8, name, node.name[0..name.len])) {
+                    parent_index = current_index;
+                    break;
+                }
+                current_index += 1;
+            }
+            if (current_index == nodes.len) {
+                return null; //went beyond the node list, didn't find
+            }
+        }
+        return current_index;
     }
 };
 
@@ -187,6 +220,101 @@ test "directory sizes" {
     try expectEqual(@as(u64, 3), nodes[2].size);
 }
 
+test "finding by path" {
+    var nodes: [6]TreeNode = undefined;
+    nodes[0] = TreeNode.init_root();
+    nodes[1] = try TreeNode.init_dir(&nodes, 0, "C:"); // drive
+    nodes[2] = try TreeNode.init_dir(&nodes, 1, "foo"); // dir
+    nodes[3] = try TreeNode.init_file(&nodes, 2, "bar.txt", 1);
+    nodes[4] = try TreeNode.init_file(&nodes, 2, "baz.zip", 2);
+    nodes[5] = try TreeNode.init_file(&nodes, 1, "fubar", 4);
+
+    const full_path = if (builtin.os.tag == .windows) "C:\\foo\\baz.zip" else "/C:/foo/baz.zip";
+    try expectEqual(@as(?usize, 4), TreeNode.find_path_index(&nodes, full_path));
+    const bad_path = if (builtin.os.tag == .windows) "C:\\nonexistent" else "/C:/nonexistent";
+    try expectEqual(@as(?usize, null), TreeNode.find_path_index(&nodes, bad_path));
+
+    try expectEqual(@as(?usize, 0), TreeNode.find_path_index(&nodes, ""));
+}
+
+fn find_or_add_path_index(node_list: *std.ArrayList(TreeNode), path: []const u8) !usize {
+    var iter = SubpathIterator.init(path);
+    var parent_subpath: []const u8 = "";
+    while (iter.next()) |subpath| {
+        if (TreeNode.find_path_index(node_list.items, subpath) == null) {
+            const parent_index = TreeNode.find_path_index(node_list.items, parent_subpath).?;
+            var this_name = subpath[parent_subpath.len..];
+            if (this_name[0] == std.fs.path.sep) this_name = this_name[1..];
+            try node_list.append(try TreeNode.init_dir(node_list.items, parent_index, this_name));
+        }
+        parent_subpath = subpath;
+    }
+    return TreeNode.find_path_index(node_list.items, path).?;
+}
+
+test "adding path" {
+    var node_list = std.ArrayList(TreeNode).init(std.testing.allocator);
+    defer node_list.deinit();
+
+    try node_list.append(TreeNode.init_root());
+    try node_list.append(try TreeNode.init_dir(node_list.items, 0, "C:")); // drive
+    try node_list.append(try TreeNode.init_dir(node_list.items, 1, "foo")); // dir
+    try node_list.append(try TreeNode.init_file(node_list.items, 2, "bar.txt", 1));
+    try node_list.append(try TreeNode.init_file(node_list.items, 2, "baz.zip", 2));
+    try node_list.append(try TreeNode.init_file(node_list.items, 1, "fubar", 4));
+
+    const full_path = if (builtin.os.tag == .windows) "C:\\foo\\baz.zip" else "/C:/foo/baz.zip";
+    try expectEqual(@as(usize, 4), try find_or_add_path_index(&node_list, full_path));
+
+    const new_path = if (builtin.os.tag == .windows) "C:\\nonexistent" else "/C:/nonexistent";
+    try expectEqual(@as(usize, 6), try find_or_add_path_index(&node_list, new_path));
+    var path_buffer: [MAX_PATH_LEN]u8 = undefined;
+    try expectEqualStrings(new_path, try TreeNode.full_path(&node_list.items[6], node_list.items, &path_buffer));
+    try expectEqual(NodeKind.dir, node_list.items[6].info);
+    try expectEqualStrings("nonexistent", std.mem.sliceTo(&node_list.items[6].name, 0));
+}
+
+const SubpathIterator = struct {
+    full_path: []const u8,
+    taken_chars: usize = 0,
+
+    fn init(path: []const u8) SubpathIterator {
+        var taken_chars: usize = if (builtin.os.tag != .windows and path[0] == std.fs.path.sep) 1 else 0;
+        return SubpathIterator{ .full_path = path, .taken_chars = taken_chars };
+    }
+
+    fn next(self: *SubpathIterator) ?[]const u8 {
+        if (self.taken_chars == self.full_path.len) return null;
+        const next_sep = std.mem.indexOf(u8, self.full_path[self.taken_chars..], std.fs.path.sep_str);
+        if (next_sep) |sep_idx| {
+            self.taken_chars += sep_idx + 1;
+            return self.full_path[0 .. self.taken_chars - 1];
+        } else {
+            self.taken_chars = self.full_path.len;
+            return self.full_path;
+        }
+    }
+};
+
+test "iterating over subpath" {
+    if (builtin.os.tag == .windows) {
+        const path = "C:\\Users\\Smith\\document.docx";
+        var iter = SubpathIterator.init(path);
+        try expectEqualStrings("C:", iter.next().?);
+        try expectEqualStrings("C:\\Users", iter.next().?);
+        try expectEqualStrings("C:\\Users\\Smith", iter.next().?);
+        try expectEqualStrings("C:\\Users\\Smith\\document.docx", iter.next().?);
+        try expectEqual(@as(?[]const u8, null), iter.next());
+    } else {
+        const path = "/home/smith/document.odt";
+        var iter = SubpathIterator.init(path);
+        try expectEqualStrings("/home", iter.next().?);
+        try expectEqualStrings("/home/smith", iter.next().?);
+        try expectEqualStrings("/home/smith/document.odt", iter.next().?);
+        try expectEqual(@as(?[]const u8, null), iter.next());
+    }
+}
+
 const NodeKind = enum {
     dir,
     file,
@@ -222,6 +350,8 @@ pub fn main() !void {
 
     const params = comptime clap.parseParamsComptime(
         \\-h, --help    Wyświetl tę pomoc i wyjdź.
+        \\-v, --verbose Wyświetlaj więcej informacji w trakcie pracy (można podać kilka razy)
+        \\-q, --quiet   Wyświetlaj mniej informacji
         \\<path>...     Ścieżki do przeszukania.
     );
     const parsers = comptime .{
@@ -237,10 +367,11 @@ pub fn main() !void {
     };
     defer res.deinit();
 
-    if (res.args.help) {
+    if (res.args.help != 0) {
         try clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
         return;
     }
+    const verbosity = res.args.verbose - res.args.quiet;
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
@@ -282,57 +413,63 @@ pub fn main() !void {
     // Sort by size descending
     // Print out all nodes whose parent isn't duplicate
 
-    var tree_list = std.ArrayList(TreeNode).init(alloc);
-    defer tree_list.deinit();
-
-    {
-        const root_node = TreeNode{
-            .parent = @ptrCast(*TreeNode, null),
-            .info = NodeInfo{.dir},
-        };
-        tree_list.append(root_node);
-    }
+    var node_list = std.ArrayList(TreeNode).init(alloc);
+    defer node_list.deinit();
+    try node_list.append(TreeNode.init_root());
 
     const realpath_buf: []u8 = try alloc.alloc(u8, MAX_PATH_LEN);
     defer alloc.free(realpath_buf);
 
     var file_count: u64 = 0;
+    var search_paths_ancestors: usize = 0; // count of folders above the passed paths, will be used to exclude them from results
 
     // to match the types, cast array literal to "[]T - pointer to runtime-known number of items", hence the need for &
     var search_paths = if (res.positionals.len > 0) res.positionals else @as([]const []const u8, &[_][]const u8{"."});
     for (search_paths) |path| {
+        const realpath = try (try std.fs.cwd().openDir(path, .{})).realpath(".", realpath_buf);
+        // this workaround is necessary, because there are still bugs with ".." on windows
+        // FIXME: will fail if realpath doesn't contain any separator (like "C:")
+        const parent_realpath = realpath[0..std.mem.lastIndexOfScalar(u8, realpath, std.fs.path.sep).?];
+        search_paths_ancestors = try find_or_add_path_index(&node_list, parent_realpath) + 1; // save count
+    }
+    // TODO: Validate that none of the search_paths is equal or contained in another
+
+    for (search_paths) |path| {
         var walker = try (try std.fs.cwd().openIterableDir(path, .{})).walk(alloc);
         defer walker.deinit();
 
-        std.debug.print("\nIndeksowanie {s} ...", .{path});
+        if (verbosity >= 0) std.debug.print("\nIndeksowanie {s} ...", .{path});
         while (try walker.next()) |entry| {
             if (entry.kind != .File) continue;
 
             file_count += 1;
-            if (file_count % 100 == 0) {
+            if (verbosity >= 0 and file_count % 100 == 0) {
                 std.debug.print("\rIndeksowanie {s} ... ({d} plików)", .{ path, file_count });
             }
 
+            const dir_realpath = try entry.dir.realpath(".", realpath_buf);
+            const parent_index = try find_or_add_path_index(&node_list, dir_realpath);
             const stat = try entry.dir.statFile(entry.basename);
-            const file_realpath = try entry.dir.realpath(entry.basename, realpath_buf);
-            var info = FileInfo{
-                .size = stat.size,
-            };
-            std.mem.copy(u8, &info.full_path, file_realpath);
+            try node_list.append(try TreeNode.init_file(node_list.items, parent_index, entry.basename, stat.size));
         }
     }
-    std.debug.print("\n", .{});
+    if (verbosity >= 0) std.debug.print("\n", .{});
 
     var total_size: u64 = 0;
-    for (tree_list.items) |node| {
+    for (node_list.items) |node| {
         if (node.info == .file) {
             total_size += node.size;
         }
     }
-    std.debug.print("Znaleziono {d} plików, całkowity rozmiar {s}\n", .{ file_count, format_size(total_size) });
+    if (verbosity >= 0) std.debug.print("Znaleziono {d} plików, całkowity rozmiar {s}\n", .{ file_count, format_size(total_size) });
 
-    const nodes = tree_list.items;
-    _ = nodes; // Only edit specific fields from now on
+    const nodes = node_list.items; // don't add to the list from now on
+
+    if (verbosity >= 2) {
+        for (nodes[search_paths_ancestors..]) |*node| {
+            std.debug.print("{s}\n", .{try TreeNode.full_path(node, nodes, realpath_buf)});
+        }
+    }
 
     // var same_size_count: u64 = 0;
     // var same_size_size: u64 = 0;
