@@ -3,20 +3,59 @@ const builtin = @import("builtin");
 const clap = @import("clap");
 // const clap = @import("../libs/zig-clap/clap.zig"); // For ZLS completions, not allowed when building
 
-const MAX_PATH_LEN: comptime_int = 512;
+const MAX_NAME_LEN: comptime_int = 64;
 const HASH_LEN: comptime_int = 16;
 
-const FileInfo = struct {
-    full_path: [MAX_PATH_LEN]u8 = [_]u8{0} ** MAX_PATH_LEN,
+const TreeNode = struct {
+    name: [MAX_NAME_LEN]u8 = [_]u8{0} ** MAX_NAME_LEN,
+    parent: *TreeNode, // For convenience this isn't optional pointer, I'll detect root node otherwise
     size: u64,
-    duplicate_size: bool = false,
     hash: ?[HASH_LEN]u8 = null,
+    md5: ?std.crypto.hash.Md5,
     duplicate_hash: bool = false,
+    info: NodeInfo,
 
-    fn size_desc(context: void, a: FileInfo, b: FileInfo) bool {
+    /// Sort descending by size
+    fn size_desc(context: void, a: *TreeNode, b: *TreeNode) bool {
         _ = context;
         return a.size > b.size;
     }
+
+    /// Sorts nodes to get a deterministic, content-dependent order.
+    /// (ascending hash, then ascending size)
+    /// If hashes are not calculated, will sort by size (which must be unique for files, since no hash)
+    /// Should work also for unstable sorts
+    fn parent_hashing_order(context: void, a: *TreeNode, b: *TreeNode) bool {
+        _ = context;
+        if (a.hash) |a_hash| {
+            if (b.hash) |b_hash| {
+                return std.mem.order(u8, a_hash, b_hash) == .lt;
+            } else {
+                return true; // first files with hash
+            }
+        } else if (b.hash) {
+            return false;
+        } else {
+            if (a.size == b.size) { // should only happen for a directory
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }
+    }
+};
+
+const NodeInfo = union(enum) {
+    dir: DirInfo,
+    file: FileInfo,
+};
+
+const DirInfo = struct {
+    dir_children: u64,
+    file_children: u64,
+    hashed_children: u64,
+};
+
+const FileInfo = struct {
+    duplicate_size: bool = false,
 };
 
 pub fn main() !void {
@@ -55,6 +94,43 @@ pub fn main() !void {
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
+
+    // TODO: Overall algorithm:
+    //
+    // ## Directory tree
+    //
+    // Create ArrayList for TreeNodes
+    // Set empty root element with invalid parent pointer as node 0 in list
+    // For each path passed, add nodes for it, starting from root
+    // This way every parent is on lower index in the list, and has a valid pointer
+    // Save the length of nodes above passed paths
+    // Add all passed paths
+    // Walk the directory tree, creating nodes and linking up to parent dir
+    // Add the size of file to parent dir, add relevant children count
+    // Create immutable slice for all nodes, don't modify the list anymore
+    //
+    // ## Hashing the tree
+    //
+    // Create an ArrayList of pointers to TreeNodes
+    // Sort pointer list by size
+    // Calculate a hash for all the files with duplicate sizes
+    // Sort pointer list by parent_hashing_order
+    // For each file, put its hash or size into parent dir, increase hashed_children count
+    //
+    // ### Hashing directories
+    //
+    // Put all directories with all children hashed into a slice of pointer list
+    // Sort by parent_hashing_order
+    // Repeatedly get fully hashed dirs into the slice
+    // Terminate when root is fully hashed
+    //
+    // ## Results
+    //
+    // Get a buffer of pointers to TreeNodes
+    // Sort by hash
+    // Mark all duplicate hashes
+    // Sort by size descending
+    // Print out all nodes whose parent isn't duplicate
 
     var realpath_set = std.StringHashMap(void).init(alloc);
     defer realpath_set.deinit();
