@@ -47,7 +47,10 @@ const TreeNode = struct {
     }
 
     fn init_dir(nodes: []TreeNode, parent_index: usize, name: []const u8) !TreeNode {
-        return TreeNode._init(nodes, parent_index, .dir, name);
+        var self = try TreeNode._init(nodes, parent_index, .dir, name);
+        self.hash = [_]u8{0} ** HASH_LEN; // start with empty hash, add every file into it, to be order independent
+        // XORing two duplicate files would completely remove it
+        return self;
     }
 
     fn init_file(nodes: []TreeNode, parent_index: usize, name: []const u8, size: u64) !TreeNode {
@@ -68,31 +71,20 @@ const TreeNode = struct {
         }
     }
 
-    /// Sort descending by size
+    /// Sort descending by size, then hash
     fn size_desc(context: void, a: *TreeNode, b: *TreeNode) bool {
         _ = context;
-        return a.size > b.size;
-    }
+        if (a.size != b.size) return a.size > b.size;
 
-    /// Sorts nodes to get a deterministic, content-dependent order.
-    /// (ascending hash, then ascending size)
-    /// If hashes are not calculated, will sort by size (which must be unique for files, since no hash)
-    /// Should work also for unstable sorts
-    fn parent_hashing_order(context: void, a: *TreeNode, b: *TreeNode) bool {
-        _ = context;
         if (a.hash) |a_hash| {
             if (b.hash) |b_hash| {
-                return std.mem.order(u8, a_hash, b_hash) == .lt;
+                return std.mem.order(u8, &a_hash, &b_hash) == .gt;
             } else {
-                return true; // first files with hash
-            }
-        } else if (b.hash) {
-            return false;
-        } else {
-            if (a.size == b.size) { // should only happen for a directory
-                return std.mem.order(u8, a.name, b.name) == .lt;
+                return false; // b hash is null and a not; first files with hash
             }
         }
+
+        return true; // either a hash is null, or or both are
     }
 
     fn full_path(self: *TreeNode, nodes: []TreeNode, out_buffer: []u8) ![]u8 {
@@ -123,6 +115,7 @@ const TreeNode = struct {
             }
         }
         std.mem.reverse(u8, out_buffer[0..path_len]); // reverse back the name to go from root
+        out_buffer[path_len] = 0; // for compatibility with [:0]
         return out_buffer[0..path_len];
     }
 
@@ -329,7 +322,6 @@ const DirInfo = struct {
     dir_children: u64 = 0,
     file_children: u64 = 0,
     hashed_children: u64 = 0,
-    md5: ?*std.crypto.hash.Md5 = null,
 };
 
 const FileInfo = struct {
@@ -352,6 +344,7 @@ pub fn main() !void {
         \\-h, --help    Wyświetl tę pomoc i wyjdź.
         \\-v, --verbose Wyświetlaj więcej informacji w trakcie pracy (można podać kilka razy)
         \\-q, --quiet   Wyświetlaj mniej informacji
+        //\\-d, --dirs    Traktuj strukturę folderów jako znaczącą
         \\<path>...     Ścieżki do przeszukania.
     );
     const parsers = comptime .{
@@ -371,32 +364,13 @@ pub fn main() !void {
         try clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
         return;
     }
-    const verbosity = res.args.verbose - res.args.quiet;
+    const verbosity: i16 = @as(i16, res.args.verbose) - @as(i16, res.args.quiet);
+    if (verbosity >= 2) std.debug.print("args: {any}", .{res.args});
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
 
     // TODO: Overall algorithm:
-    //
-    // ## Directory tree
-    //
-    // Create ArrayList for TreeNodes
-    // Set empty root element with invalid parent pointer as node 0 in list
-    // For each path passed, add nodes for it, starting from root
-    // This way every parent is on lower index in the list, and has a valid pointer
-    // Save the length of nodes above passed paths
-    // Add all passed paths
-    // Walk the directory tree, creating nodes and linking up to parent dir
-    // Add the size of file to parent dir, add relevant children count
-    // Create immutable slice for all nodes, don't modify the list anymore
-    //
-    // ## Hashing the tree
-    //
-    // Create an ArrayList of pointers to TreeNodes
-    // Sort pointer list by size
-    // Calculate a hash for all the files with duplicate sizes
-    // Sort pointer list by parent_hashing_order
-    // For each file, put its hash or size into parent dir, increase hashed_children count
     //
     // ### Hashing directories
     //
@@ -420,7 +394,7 @@ pub fn main() !void {
     const realpath_buf: []u8 = try alloc.alloc(u8, MAX_PATH_LEN);
     defer alloc.free(realpath_buf);
 
-    var file_count: u64 = 0;
+    var file_count: usize = 0;
     var search_paths_ancestors: usize = 0; // count of folders above the passed paths, will be used to exclude them from results
 
     // to match the types, cast array literal to "[]T - pointer to runtime-known number of items", hence the need for &
@@ -455,120 +429,154 @@ pub fn main() !void {
     }
     if (verbosity >= 0) std.debug.print("\n", .{});
 
-    var total_size: u64 = 0;
-    for (node_list.items) |node| {
-        if (node.info == .file) {
-            total_size += node.size;
-        }
-    }
-    if (verbosity >= 0) std.debug.print("Znaleziono {d} plików, całkowity rozmiar {s}\n", .{ file_count, format_size(total_size) });
+    const nodes = node_list.items; // don't modify the list from now on
 
-    const nodes = node_list.items; // don't add to the list from now on
+    TreeNode.sum_file_sizes(nodes);
+    if (verbosity >= 0) std.debug.print("Znaleziono {d} plików, całkowity rozmiar {s}\n", .{ file_count, format_size(nodes[0].size) });
 
     if (verbosity >= 2) {
         for (nodes[search_paths_ancestors..]) |*node| {
             std.debug.print("{s}\n", .{try TreeNode.full_path(node, nodes, realpath_buf)});
         }
+        std.debug.print("\n", .{});
     }
 
-    // var same_size_count: u64 = 0;
-    // var same_size_size: u64 = 0;
-    // {
-    //     // Check with either neighbor (to correctly count two and three consecutive files correctly, you have to check three per iteration)
-    //     var i: usize = 0;
-    //     while (i < files.len) : (i += 1) {
-    //         const size = files[i].size;
-    //         if (i > 0 and files[i - 1].size == size) {
-    //             same_size_count += 1;
-    //             same_size_size += files[i].size;
-    //             files[i].duplicate_size = true;
-    //             continue; // Don't count the middle file twice
-    //         }
-    //         if (i < files.len - 1 and files[i + 1].size == size) {
-    //             same_size_count += 1;
-    //             same_size_size += files[i].size;
-    //             files[i].duplicate_size = true;
-    //         }
-    //     }
+    const node_ptrs: []*TreeNode = try alloc.alloc(*TreeNode, file_count);
+    // Having space for every leaf node is enough, there has to be as many or less parents at each level
+    defer alloc.free(node_ptrs);
+
+    {
+        var i: usize = 0;
+        for (nodes) |*node| {
+            if (node.info == .file) {
+                node_ptrs[i] = node;
+                i += 1;
+            }
+        }
+    }
+    std.sort.sort(*TreeNode, node_ptrs, {}, TreeNode.size_desc);
+
+    if (verbosity >= 2) {
+        std.debug.print("Posortowane pliki:\n", .{});
+        for (node_ptrs) |node| {
+            std.debug.print("{s}\t{s}\n", .{ format_size(node.size), try TreeNode.full_path(node, nodes, realpath_buf) });
+        }
+        std.debug.print("\n", .{});
+    }
+
+    var same_size_count: u64 = 0;
+    var same_size_size: u64 = 0;
+    {
+        // Check with either neighbor (to correctly count two and three consecutive files correctly, you have to check three per iteration)
+        var i: usize = 0;
+        while (i < node_ptrs.len) : (i += 1) {
+            const size = node_ptrs[i].size;
+            if (i > 0 and node_ptrs[i - 1].size == size) {
+                same_size_count += 1;
+                same_size_size += node_ptrs[i].size;
+                switch (node_ptrs[i].info) {
+                    .file => |*info| info.duplicate_size = true,
+                    .dir => unreachable, // only expect files here
+                }
+                continue; // Don't count the middle file twice
+            }
+            if (i < node_ptrs.len - 1 and node_ptrs[i + 1].size == size) {
+                same_size_count += 1;
+                same_size_size += node_ptrs[i].size;
+                switch (node_ptrs[i].info) {
+                    .file => |*info| info.duplicate_size = true,
+                    .dir => unreachable, // only expect files here
+                }
+            }
+        }
+    }
+    if (verbosity >= 0) std.debug.print("{d} plików ma ten sam rozmiar\n", .{same_size_count});
+
+    const hash_start_time = std.time.timestamp();
+    var done_hashes_count: u64 = 0;
+    var done_hashes_size: u64 = 0;
+    for (node_ptrs) |node| {
+        switch (node.info) {
+            .file => |info| if (!info.duplicate_size) continue,
+            .dir => unreachable,
+        }
+
+        std.debug.print("przetwarzanie pliku {s}", .{format_size(node.size)});
+        var hash = std.crypto.hash.Md5.init(.{});
+        var file = try std.fs.openFileAbsoluteZ(@ptrCast([*:0]const u8, try TreeNode.full_path(node, nodes, realpath_buf)), .{});
+        defer file.close();
+        var buf_reader = std.io.bufferedReader(file.reader());
+        var in_stream = buf_reader.reader();
+
+        var buf: [1024]u8 = undefined;
+        while (try in_stream.read(&buf) > 0) {
+            hash.update(&buf);
+        }
+        var hash_buf: [16]u8 = undefined;
+        hash.final(&hash_buf);
+        node.hash = hash_buf;
+
+        const time_elapsed = std.math.absCast(std.time.timestamp() - hash_start_time);
+        done_hashes_count += 1;
+        const count_part: f64 = @intToFloat(f64, done_hashes_count) / @intToFloat(f64, same_size_count);
+        const count_eta: u64 = std.math.absCast(@floatToInt(i64, @intToFloat(f64, time_elapsed) / count_part * (1 - count_part)));
+        done_hashes_size += node.size;
+        const size_part: f64 = @intToFloat(f64, done_hashes_size) / @intToFloat(f64, same_size_size);
+        const size_eta: u64 = std.math.absCast(@floatToInt(i64, @intToFloat(f64, time_elapsed) / size_part * (1 - size_part)));
+
+        std.debug.print("\r{s}: {d}/{d} ({d:.2}% ETA: {s}), {s}/{s} ({d:.2}% ETA: {s}), ", .{ format_time(time_elapsed), done_hashes_count, same_size_count, count_part * 100, format_time(count_eta), format_size(done_hashes_size), format_size(same_size_size), size_part * 100, format_time(size_eta) });
+    }
+    std.debug.print("{s}\n", .{[_]u8{' '} ** 25}); // overwrite the opened file text from loop
+
+    // // TODO: Include directory structure
+    // if (res.args.dirs != 0) {
+
     // }
-    // std.debug.print("{d} plików ma ten sam rozmiar\n", .{same_size_count});
 
-    // const hash_start_time = std.time.timestamp();
-    // var done_hashes_count: u64 = 0;
-    // var done_hashes_size: u64 = 0;
-    // for (files, 0..) |info, i| {
-    //     if (info.duplicate_size) {
-    //         std.debug.print("przetwarzanie pliku {s}", .{format_size(info.size)});
-    //         var hash = std.crypto.hash.Md5.init(.{});
-    //         var file = try std.fs.openFileAbsoluteZ(@ptrCast([*:0]const u8, &info.full_path), .{});
-    //         defer file.close();
-    //         var buf_reader = std.io.bufferedReader(file.reader());
-    //         var in_stream = buf_reader.reader();
+    std.sort.sort(*TreeNode, node_ptrs, {}, TreeNode.size_desc); // also sorts by hash
+    var same_file_hash_count: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < node_ptrs.len) : (i += 1) {
+            if (node_ptrs[i].hash) |hash| {
+                if (i > 0) {
+                    if (node_ptrs[i - 1].hash) |prev_hash| {
+                        if (std.mem.eql(u8, &hash, &prev_hash)) {
+                            node_ptrs[i].duplicate_hash = true;
+                            same_file_hash_count += 1;
+                            continue; // Skip comparison with next
+                        }
+                    }
+                }
 
-    //         var buf: [1024]u8 = undefined;
-    //         while (try in_stream.read(&buf) > 0) {
-    //             hash.update(&buf);
-    //         }
-    //         var hash_buf: [16]u8 = undefined;
-    //         hash.final(&hash_buf);
-    //         files[i].hash = hash_buf;
+                if (i < node_ptrs.len - 1) {
+                    if (node_ptrs[i + 1].hash) |next_hash| {
+                        if (std.mem.eql(u8, &hash, &next_hash)) {
+                            node_ptrs[i].duplicate_hash = true;
+                            same_file_hash_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std.debug.print("Znaleziono {d} plików o tej samej zawartości\n", .{same_file_hash_count});
 
-    //         const time_elapsed = std.math.absCast(std.time.timestamp() - hash_start_time);
-    //         done_hashes_count += 1;
-    //         const count_part: f64 = @intToFloat(f64, done_hashes_count) / @intToFloat(f64, same_size_count);
-    //         const count_eta: u64 = std.math.absCast(@floatToInt(i64, @intToFloat(f64, time_elapsed) / count_part * (1 - count_part)));
-    //         done_hashes_size += files[i].size;
-    //         const size_part: f64 = @intToFloat(f64, done_hashes_size) / @intToFloat(f64, same_size_size);
-    //         const size_eta: u64 = std.math.absCast(@floatToInt(i64, @intToFloat(f64, time_elapsed) / size_part * (1 - size_part)));
-
-    //         std.debug.print("\r{s}: {d}/{d} ({d:.2}% ETA: {s}), {s}/{s} ({d:.2}% ETA: {s}), ", .{ format_time(time_elapsed), done_hashes_count, same_size_count, count_part * 100, format_time(count_eta), format_size(done_hashes_size), format_size(same_size_size), size_part * 100, format_time(size_eta) });
-    //     }
-    // }
-    // std.debug.print("{s}\n", .{[_]u8{' '} ** 25}); // overwrite the opened file text from loop
-
-    // var same_hash_count: u64 = 0;
-    // {
-    //     var i: usize = 0;
-    //     while (i < files.len) : (i += 1) {
-    //         if (files[i].hash) |hash| {
-    //             if (i > 0) {
-    //                 if (files[i - 1].hash) |prev_hash| {
-    //                     if (std.mem.eql(u8, &hash, &prev_hash)) {
-    //                         files[i].duplicate_hash = true;
-    //                         same_hash_count += 1;
-    //                         continue; // Skip comparison with next
-    //                     }
-    //                 }
-    //             }
-
-    //             if (i < files.len - 1) {
-    //                 if (files[i + 1].hash) |next_hash| {
-    //                     if (std.mem.eql(u8, &hash, &next_hash)) {
-    //                         files[i].duplicate_hash = true;
-    //                         same_hash_count += 1;
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
-    // std.debug.print("Znaleziono {d} plików o tej samej zawartości\n", .{same_hash_count});
-
-    // {
-    //     var stdout = std.io.getStdOut();
-    //     var writer = stdout.writer();
-    //     var last_hash = [_]u8{0} ** HASH_LEN;
-    //     for (file_list.items) |info| {
-    //         if (info.duplicate_hash) {
-    //             const hash = info.hash.?;
-    //             if (!std.mem.eql(u8, &last_hash, &hash)) {
-    //                 try writer.print("\n", .{});
-    //             }
-    //             try writer.print("{s}\t{s}\n", .{ format_size(info.size), info.full_path });
-    //             std.mem.copy(u8, &last_hash, &hash);
-    //         }
-    //     }
-    // }
+    {
+        var stdout = std.io.getStdOut();
+        var writer = stdout.writer();
+        var last_hash = [_]u8{0} ** HASH_LEN;
+        for (node_ptrs) |node| {
+            if (node.duplicate_hash) {
+                const hash = node.hash.?;
+                if (!std.mem.eql(u8, &last_hash, &hash)) {
+                    try writer.print("\n", .{});
+                }
+                try writer.print("{s}\t{s}\n", .{ format_size(node.size), try TreeNode.full_path(node, nodes, realpath_buf) });
+                @memcpy(&last_hash, &hash);
+            }
+        }
+    }
 }
 
 fn format_size(size: u64) [5]u8 {
