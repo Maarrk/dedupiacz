@@ -4,6 +4,7 @@ const clap = @import("clap");
 // const clap = @import("../libs/zig-clap/clap.zig"); // For ZLS completions, not allowed when building
 
 const expectEqual = std.testing.expectEqual;
+const expectEqualSlices = std.testing.expectEqualSlices;
 const expectEqualStrings = std.testing.expectEqualStrings;
 
 const MAX_PATH_LEN: comptime_int = 512;
@@ -47,10 +48,7 @@ const TreeNode = struct {
     }
 
     fn init_dir(nodes: []TreeNode, parent_index: usize, name: []const u8) !TreeNode {
-        var self = try TreeNode._init(nodes, parent_index, .dir, name);
-        self.hash = [_]u8{0} ** HASH_LEN; // start with empty hash, add every file into it, to be order independent
-        // XORing two duplicate files would completely remove it
-        return self;
+        return TreeNode._init(nodes, parent_index, .dir, name);
     }
 
     fn init_file(nodes: []TreeNode, parent_index: usize, name: []const u8, size: u64) !TreeNode {
@@ -148,6 +146,33 @@ const TreeNode = struct {
             }
         }
         return current_index;
+    }
+
+    // Adding was chosen to ignore order of operations; XOR would have more data, but XORing the same file twice would remove it
+
+    /// Add other hash to this one, as if they were two u512 little-endian numbers, allowing overflow
+    fn add_hash(self: *TreeNode, hash: [HASH_LEN]u8) void {
+        if (self.hash == null) {
+            self.hash = [_]u8{0} ** HASH_LEN;
+        }
+        var self_hash = (self.hash.?)[0..];
+        var carry: u1 = 0;
+        for (0..HASH_LEN) |i| {
+            const sum: u9 = @as(u9, self_hash[i]) + @as(u9, hash[i]) + @as(u9, carry);
+            self_hash[i] = @intCast(u8, sum & 0xFF);
+            carry = @intCast(u1, sum >> 8);
+        }
+    }
+
+    /// Add other size to this hash, as if it were a u512 little-endian number.
+    fn add_size(self: *TreeNode, size: u64) void {
+        var hash_buf = [_]u8{0} ** HASH_LEN;
+        @memcpy(hash_buf[0..@sizeOf(u64)], @ptrCast(*[@sizeOf(u64)]u8, @constCast(&size)));
+        switch (builtin.target.cpu.arch.endian()) {
+            .Big => std.mem.reverse(u8, hash_buf[0..@sizeOf(u64)]),
+            .Little => {}, //do nothing
+        }
+        self.add_hash(hash_buf);
     }
 };
 
@@ -265,6 +290,45 @@ test "adding path" {
     try expectEqualStrings(new_path, try TreeNode.full_path(&node_list.items[6], node_list.items, &path_buffer));
     try expectEqual(NodeKind.dir, node_list.items[6].info);
     try expectEqualStrings("nonexistent", std.mem.sliceTo(&node_list.items[6].name, 0));
+}
+
+test "adding to hash" {
+    var nodes: [2]TreeNode = undefined;
+    nodes[0] = TreeNode.init_root();
+    nodes[1] = try TreeNode.init_dir(&nodes, 0, "dir");
+
+    // Start from zero
+    const hash1 = [_]u8{127} ** HASH_LEN;
+    nodes[1].add_hash(hash1);
+    try expectEqualSlices(u8, &hash1, &(nodes[1].hash.?));
+
+    // Overflow a single byte
+    const hash2 = [1]u8{129} ++ [_]u8{0} ** (HASH_LEN - 1);
+    const result2 = [2]u8{ 0, 128 } ++ [_]u8{127} ** (HASH_LEN - 2);
+    nodes[1].add_hash(hash2);
+    try expectEqualSlices(u8, &result2, &(nodes[1].hash.?));
+
+    // Overflow the whole array
+    const hash3 = [1]u8{0} ++ [_]u8{128} ** (HASH_LEN - 1);
+    const result3 = [_]u8{0} ** (HASH_LEN);
+    nodes[1].add_hash(hash3);
+    try expectEqualSlices(u8, &result3, &(nodes[1].hash.?));
+}
+
+test "adding size to hash" {
+    var nodes: [2]TreeNode = undefined;
+    nodes[0] = TreeNode.init_root();
+    nodes[1] = try TreeNode.init_dir(&nodes, 0, "dir");
+
+    const size1 = 42;
+    const result1 = [1]u8{size1} ++ [_]u8{0} ** (HASH_LEN - 1);
+    nodes[1].add_size(size1);
+    try expectEqualSlices(u8, &result1, &(nodes[1].hash.?));
+
+    const size2 = 0x10000 - size1;
+    const result2 = [3]u8{ 0, 0, 1 } ++ [_]u8{0} ** (HASH_LEN - 3);
+    nodes[1].add_size(size2);
+    try expectEqualSlices(u8, &result2, &(nodes[1].hash.?));
 }
 
 const SubpathIterator = struct {
@@ -441,11 +505,10 @@ pub fn main() !void {
         std.debug.print("\n", .{});
     }
 
-    const node_ptrs: []*TreeNode = try alloc.alloc(*TreeNode, file_count);
-    // Having space for every leaf node is enough, there has to be as many or less parents at each level
+    var node_ptrs: []*TreeNode = try alloc.alloc(*TreeNode, nodes.len);
     defer alloc.free(node_ptrs);
 
-    {
+    { // put all files into node_ptrs
         var i: usize = 0;
         for (nodes) |*node| {
             if (node.info == .file) {
@@ -454,11 +517,11 @@ pub fn main() !void {
             }
         }
     }
-    std.sort.sort(*TreeNode, node_ptrs, {}, TreeNode.size_desc);
+    std.sort.sort(*TreeNode, node_ptrs[0..file_count], {}, TreeNode.size_desc);
 
     if (verbosity >= 2) {
         std.debug.print("Posortowane pliki:\n", .{});
-        for (node_ptrs) |node| {
+        for (node_ptrs[0..file_count]) |node| {
             std.debug.print("{s}\t{s}\n", .{ format_size(node.size), try TreeNode.full_path(node, nodes, realpath_buf) });
         }
         std.debug.print("\n", .{});
@@ -469,7 +532,7 @@ pub fn main() !void {
     {
         // Check with either neighbor (to correctly count two and three consecutive files correctly, you have to check three per iteration)
         var i: usize = 0;
-        while (i < node_ptrs.len) : (i += 1) {
+        while (i < file_count) : (i += 1) {
             const size = node_ptrs[i].size;
             if (i > 0 and node_ptrs[i - 1].size == size) {
                 same_size_count += 1;
@@ -480,7 +543,7 @@ pub fn main() !void {
                 }
                 continue; // Don't count the middle file twice
             }
-            if (i < node_ptrs.len - 1 and node_ptrs[i + 1].size == size) {
+            if (i < file_count - 1 and node_ptrs[i + 1].size == size) {
                 same_size_count += 1;
                 same_size_size += node_ptrs[i].size;
                 switch (node_ptrs[i].info) {
@@ -495,7 +558,7 @@ pub fn main() !void {
     const hash_start_time = std.time.timestamp();
     var done_hashes_count: u64 = 0;
     var done_hashes_size: u64 = 0;
-    for (node_ptrs) |node| {
+    for (node_ptrs[0..file_count]) |node| {
         switch (node.info) {
             .file => |info| if (!info.duplicate_size) continue,
             .dir => unreachable,
@@ -533,11 +596,11 @@ pub fn main() !void {
 
     // }
 
-    std.sort.sort(*TreeNode, node_ptrs, {}, TreeNode.size_desc); // also sorts by hash
+    std.sort.sort(*TreeNode, node_ptrs[0..file_count], {}, TreeNode.size_desc); // also sorts by hash
     var same_file_hash_count: u64 = 0;
     {
         var i: usize = 0;
-        while (i < node_ptrs.len) : (i += 1) {
+        while (i < file_count) : (i += 1) {
             if (node_ptrs[i].hash) |hash| {
                 if (i > 0) {
                     if (node_ptrs[i - 1].hash) |prev_hash| {
@@ -549,7 +612,7 @@ pub fn main() !void {
                     }
                 }
 
-                if (i < node_ptrs.len - 1) {
+                if (i < file_count - 1) {
                     if (node_ptrs[i + 1].hash) |next_hash| {
                         if (std.mem.eql(u8, &hash, &next_hash)) {
                             node_ptrs[i].duplicate_hash = true;
@@ -562,12 +625,66 @@ pub fn main() !void {
     }
     std.debug.print("Znaleziono {d} plików o tej samej zawartości\n", .{same_file_hash_count});
 
+    for (0..nodes.len) |i| { // add hashes into parents
+        const i_rev = nodes.len - 1 - i;
+        const node = nodes[i_rev];
+        if (node.parent_index) |parent_index| {
+            if (node.hash) |hash| {
+                nodes[parent_index].add_hash(hash);
+            } else {
+                nodes[parent_index].add_size(node.size);
+            }
+        }
+    }
+
+    // Find duplicate hashes for directories
+    // Only consider nodes at or below search_paths, and only nodes with sibling to avoid marking identical child as duplicate
+    var nodes_with_siblings: usize = 0;
+    for (nodes[search_paths_ancestors..]) |*node| {
+        const parent = nodes[node.parent_index.?]; // Since ancestors are skipped, there definitely isn't root node
+        const parent_info: DirInfo = switch (parent.info) {
+            .dir => |info| info,
+            .file => unreachable, // Files can't be parents
+        };
+        if (parent_info.dir_children + parent_info.file_children > 1) {
+            node_ptrs[nodes_with_siblings] = node;
+            nodes_with_siblings += 1;
+        }
+    }
+    std.sort.sort(*TreeNode, node_ptrs[0..nodes_with_siblings], {}, TreeNode.size_desc);
+    {
+        var i: usize = 0;
+        while (i < nodes_with_siblings) : (i += 1) {
+            if (node_ptrs[i].hash) |hash| {
+                if (i > 0) {
+                    if (node_ptrs[i - 1].hash) |prev_hash| {
+                        if (std.mem.eql(u8, &hash, &prev_hash)) {
+                            node_ptrs[i].duplicate_hash = true;
+                            continue; // Skip comparison with next
+                        }
+                    }
+                }
+
+                if (i < nodes_with_siblings - 1) {
+                    if (node_ptrs[i + 1].hash) |next_hash| {
+                        if (std.mem.eql(u8, &hash, &next_hash)) {
+                            node_ptrs[i].duplicate_hash = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     {
         var stdout = std.io.getStdOut();
         var writer = stdout.writer();
         var last_hash = [_]u8{0} ** HASH_LEN;
-        for (node_ptrs) |node| {
+        for (node_ptrs[0..nodes_with_siblings]) |node| {
             if (node.duplicate_hash) {
+                if (node.parent_index) |parent_index| {
+                    if (nodes[parent_index].duplicate_hash) continue;
+                }
                 const hash = node.hash.?;
                 if (!std.mem.eql(u8, &last_hash, &hash)) {
                     try writer.print("\n", .{});
