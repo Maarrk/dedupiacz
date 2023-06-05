@@ -86,6 +86,11 @@ const TreeNode = struct {
         }
     }
 
+    fn name_asc(context: void, a: *TreeNode, b: *TreeNode) bool {
+        _ = context;
+        return std.mem.order(u8, &a.name, &b.name) == .lt;
+    }
+
     fn full_path(self: *TreeNode, nodes: []TreeNode, out_buffer: []u8) ![]u8 {
         var path_len: usize = 0;
         const offset = @ptrToInt(self) - @ptrToInt(&nodes[0]);
@@ -409,6 +414,7 @@ pub fn main() !void {
         \\-h, --help    Wyświetl tę pomoc i wyjdź.
         \\-v, --verbose Wyświetlaj więcej informacji w trakcie pracy (można podać kilka razy)
         \\-q, --quiet   Wyświetlaj mniej informacji
+        \\-i, --interactive Interaktywnie usuwaj pliki po przeszukaniu drzewa
         //\\-d, --dirs    Traktuj strukturę folderów jako znaczącą
         \\<path>...     Ścieżki do przeszukania.
     );
@@ -662,9 +668,11 @@ pub fn main() !void {
 
     var duplicate_files: usize = 0;
     var duplicate_dirs: usize = 0;
+    var duplicate_elements: usize = 0;
+    var deleted_size: u64 = 0;
     {
-        var stdout = std.io.getStdOut();
-        var writer = stdout.writer();
+        const stdout = std.io.getStdOut();
+        var out_writer = stdout.writer();
         var last_hash = [_]u8{0} ** HASH_LEN;
         for (node_ptrs[0..nodes_with_siblings]) |node| {
             if (node.duplicate_hash) {
@@ -677,15 +685,70 @@ pub fn main() !void {
                     if (nodes[parent_index].duplicate_hash) continue;
                 }
                 const hash = node.hash.?;
-                if (!std.mem.eql(u8, &last_hash, &hash)) {
-                    try writer.print("\n", .{});
+                if (!std.mem.eql(u8, &last_hash, &hash)) { // FIXME: some way to also show the last pair
+                    if (res.args.interactive == 0) try out_writer.print("\n", .{});
+                    duplicate_elements += 1;
                 }
-                try writer.print("{s}\t{s}\n", .{ format_size(node.size), try TreeNode.full_path(node, nodes, realpath_buf) });
+                if (res.args.interactive == 0) try out_writer.print("{s}\t{s}\n", .{ format_size(node.size), try TreeNode.full_path(node, nodes, realpath_buf) });
                 @memcpy(&last_hash, &hash);
             }
         }
     }
     if (verbosity >= 0) std.debug.print("Rozpoznano {d} zduplikowanych folderów i {d} pojedynczych plików\n", .{ duplicate_dirs, duplicate_files });
+
+    if (res.args.interactive != 0) {
+        const stdout = std.io.getStdOut();
+        var out_writer = stdout.writer();
+        var last_hash = [_]u8{0} ** HASH_LEN;
+        const stdin = std.io.getStdIn();
+        var input_buffer: [MAX_NAME_LEN]u8 = undefined;
+        var options_list = std.ArrayList(*TreeNode).init(alloc);
+        defer options_list.deinit();
+        var handled_duplicates: usize = 0;
+
+        for (node_ptrs[0..nodes_with_siblings]) |node| {
+            if (node.duplicate_hash) {
+                if (node.parent_index) |parent_index| {
+                    if (nodes[parent_index].duplicate_hash) continue;
+                }
+                const hash = node.hash.?;
+                if (!std.mem.eql(u8, &last_hash, &hash) and options_list.items.len > 0) { // FIXME: some way to also show the last pair
+                    handled_duplicates += 1;
+                    try out_writer.print("\n{d}/{d} Wybierz plik (rozmiar {s}) do pozostawienia, lub 'n' aby pominąć usuwanie\n", .{ handled_duplicates, duplicate_elements, format_size(options_list.items[0].size) });
+
+                    std.sort.sort(*TreeNode, options_list.items, {}, TreeNode.name_asc);
+                    for (options_list.items, 1..) |option, i| {
+                        try out_writer.print("{d}: {s}\n", .{ i, try TreeNode.full_path(option, nodes, realpath_buf) });
+                    }
+
+                    const input = (try nextLine(stdin.reader(), &input_buffer)).?;
+                    if (input[0] == 'n') {
+                        try out_writer.print("Pomijam usuwanie pliku\n", .{});
+                    } else if (std.fmt.parseInt(u16, input, 10) catch null) |choice| {
+                        try out_writer.print("Pozostawiam {d}\n", .{choice});
+                        for (options_list.items, 1..) |deleted_node, i| {
+                            if (i != choice) {
+                                switch (deleted_node.info) {
+                                    .file => {
+                                        try std.fs.deleteFileAbsolute(try TreeNode.full_path(deleted_node, nodes, realpath_buf));
+                                    },
+                                    .dir => {
+                                        try std.fs.deleteDirAbsolute(try TreeNode.full_path(deleted_node, nodes, realpath_buf));
+                                    },
+                                }
+                                deleted_size += deleted_node.size;
+                            }
+                        }
+                    }
+                    options_list.clearRetainingCapacity();
+                }
+                try options_list.append(node);
+                @memcpy(&last_hash, &hash);
+            }
+        }
+
+        std.debug.print("Usunięto pliki o łącznym rozmiarze {s}\n", .{format_size(deleted_size)});
+    }
 }
 
 fn format_size(size: u64) [5]u8 {
@@ -744,4 +807,17 @@ fn format_time(time_seconds: u64) [6]u8 {
     }
 
     return result;
+}
+
+fn nextLine(reader: anytype, buffer: []u8) !?[]const u8 {
+    var line = (try reader.readUntilDelimiterOrEof(
+        buffer,
+        '\n',
+    )) orelse return null;
+    // trim annoying windows-only carriage return character
+    if (@import("builtin").os.tag == .windows) {
+        return std.mem.trimRight(u8, line, "\r");
+    } else {
+        return line;
+    }
 }
