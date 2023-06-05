@@ -415,10 +415,12 @@ pub fn main() !void {
         \\-v, --verbose Wyświetlaj więcej informacji w trakcie pracy (można podać kilka razy)
         \\-q, --quiet   Wyświetlaj mniej informacji
         \\-i, --interactive Interaktywnie usuwaj pliki po przeszukaniu drzewa
-        //\\-d, --dirs    Traktuj strukturę folderów jako znaczącą
+        \\--exclude <str>   Ignoruj pliki zawierające ten tekst w ścieżce
         \\<path>...     Ścieżki do przeszukania.
     );
+    // TODO: \\-d, --dirs    Traktuj strukturę folderów jako znaczącą
     const parsers = comptime .{
+        .str = clap.parsers.string,
         .path = clap.parsers.string,
     };
 
@@ -445,8 +447,7 @@ pub fn main() !void {
     defer node_list.deinit();
     try node_list.append(TreeNode.init_root());
 
-    const realpath_buf: []u8 = try alloc.alloc(u8, MAX_PATH_LEN);
-    defer alloc.free(realpath_buf);
+    var realpath_buf: [MAX_PATH_LEN]u8 = undefined;
 
     var file_count: usize = 0;
     var search_paths_ancestors: usize = 0; // count of folders above the passed paths, will be used to exclude them from results
@@ -454,7 +455,7 @@ pub fn main() !void {
     // to match the types, cast array literal to "[]T - pointer to runtime-known number of items", hence the need for &
     var search_paths = if (res.positionals.len > 0) res.positionals else @as([]const []const u8, &[_][]const u8{"."});
     for (search_paths) |path| {
-        const realpath = try (try std.fs.cwd().openDir(path, .{})).realpath(".", realpath_buf);
+        const realpath = try (try std.fs.cwd().openDir(path, .{})).realpath(".", &realpath_buf);
         // this workaround is necessary, because there are still bugs with ".." on windows
         // FIXME: will fail if realpath doesn't contain any separator (like "C:")
         const parent_realpath = realpath[0..std.mem.lastIndexOfScalar(u8, realpath, std.fs.path.sep).?];
@@ -470,12 +471,20 @@ pub fn main() !void {
         while (try walker.next()) |entry| {
             if (entry.kind != .File) continue;
 
+            const file_realpath = try entry.dir.realpath(entry.basename, &realpath_buf);
+            if (res.args.exclude) |exclude_str| {
+                if (std.mem.indexOf(u8, file_realpath, exclude_str) != null) {
+                    if (verbosity >= 3) std.debug.print("Pomijanie pliku {s}\n", .{file_realpath});
+                    continue;
+                }
+            }
+
             file_count += 1;
             if (verbosity >= 0 and file_count % 100 == 0) {
                 std.debug.print("\rIndeksowanie {s} ... ({d} plików)", .{ path, file_count });
             }
 
-            const dir_realpath = try entry.dir.realpath(".", realpath_buf);
+            const dir_realpath = try entry.dir.realpath(".", &realpath_buf);
             const parent_index = try find_or_add_path_index(&node_list, dir_realpath);
             const stat = try entry.dir.statFile(entry.basename);
             try node_list.append(try TreeNode.init_file(node_list.items, parent_index, entry.basename, stat.size));
@@ -490,7 +499,7 @@ pub fn main() !void {
 
     if (verbosity >= 2) {
         for (nodes[search_paths_ancestors..]) |*node| {
-            std.debug.print("{s}\n", .{try TreeNode.full_path(node, nodes, realpath_buf)});
+            std.debug.print("{s}\n", .{try TreeNode.full_path(node, nodes, &realpath_buf)});
         }
         std.debug.print("\n", .{});
     }
@@ -512,7 +521,7 @@ pub fn main() !void {
     if (verbosity >= 2) {
         std.debug.print("Posortowane pliki:\n", .{});
         for (node_ptrs[0..file_count]) |node| {
-            std.debug.print("{s}\t{s}\n", .{ format_size(node.size), try TreeNode.full_path(node, nodes, realpath_buf) });
+            std.debug.print("{s}\t{s}\n", .{ format_size(node.size), try TreeNode.full_path(node, nodes, &realpath_buf) });
         }
         std.debug.print("\n", .{});
     }
@@ -556,7 +565,7 @@ pub fn main() !void {
 
         if (verbosity >= 0) std.debug.print("przetwarzanie pliku {s}", .{format_size(node.size)});
         var hash = std.crypto.hash.Md5.init(.{});
-        var file = try std.fs.openFileAbsoluteZ(@ptrCast([*:0]const u8, try TreeNode.full_path(node, nodes, realpath_buf)), .{});
+        var file = try std.fs.openFileAbsoluteZ(@ptrCast([*:0]const u8, try TreeNode.full_path(node, nodes, &realpath_buf)), .{});
         defer file.close();
         var buf_reader = std.io.bufferedReader(file.reader());
         var in_stream = buf_reader.reader();
@@ -689,7 +698,7 @@ pub fn main() !void {
                     if (res.args.interactive == 0) try out_writer.print("\n", .{});
                     duplicate_elements += 1;
                 }
-                if (res.args.interactive == 0) try out_writer.print("{s}\t{s}\n", .{ format_size(node.size), try TreeNode.full_path(node, nodes, realpath_buf) });
+                if (res.args.interactive == 0) try out_writer.print("{s}\t{s}\n", .{ format_size(node.size), try TreeNode.full_path(node, nodes, &realpath_buf) });
                 @memcpy(&last_hash, &hash);
             }
         }
@@ -718,7 +727,7 @@ pub fn main() !void {
 
                     std.sort.sort(*TreeNode, options_list.items, {}, TreeNode.name_asc);
                     for (options_list.items, 1..) |option, i| {
-                        try out_writer.print("{d}: {s}\n", .{ i, try TreeNode.full_path(option, nodes, realpath_buf) });
+                        try out_writer.print("{d}: {s}\n", .{ i, try TreeNode.full_path(option, nodes, &realpath_buf) });
                     }
 
                     const input = (try nextLine(stdin.reader(), &input_buffer)).?;
@@ -728,14 +737,7 @@ pub fn main() !void {
                         try out_writer.print("Pozostawiam {d}\n", .{choice});
                         for (options_list.items, 1..) |deleted_node, i| {
                             if (i != choice) {
-                                switch (deleted_node.info) {
-                                    .file => {
-                                        try std.fs.deleteFileAbsolute(try TreeNode.full_path(deleted_node, nodes, realpath_buf));
-                                    },
-                                    .dir => {
-                                        try std.fs.deleteDirAbsolute(try TreeNode.full_path(deleted_node, nodes, realpath_buf));
-                                    },
-                                }
+                                try std.fs.deleteTreeAbsolute(try TreeNode.full_path(deleted_node, nodes, &realpath_buf));
                                 deleted_size += deleted_node.size;
                             }
                         }
