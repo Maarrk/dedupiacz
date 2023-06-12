@@ -25,11 +25,11 @@ pub fn main() !void {
         \\-v, --verbose     Wyświetlaj więcej informacji w trakcie pracy (można podać kilka razy)
         \\-q, --quiet       Wyświetlaj mniej informacji
         \\-i, --interactive Interaktywnie usuwaj pliki po przeszukaniu drzewa
+        \\-d, --dirs        Traktuj nazwy folderów jako znaczące
         \\--exclude <str>   Ignoruj pliki zawierające ten tekst w ścieżce
         \\<path>...         Ścieżki do przeszukania.
     );
     // Arguments roadmap:
-    // \\-d, --dirs         Traktuj strukturę folderów jako znaczącą
     // \\-s, --save <file>  Zapisz wyniki skanowania do pliku JSON
     // \\-l, --load <file>  Wczytaj zapisane drzewo zamiast skanować ścieżkę
     const parsers = comptime .{
@@ -260,11 +260,6 @@ pub fn main() !void {
     }
     if (verbosity >= 0) std.debug.print("Znaleziono {d} plików o tej samej zawartości\n", .{same_file_hash_count});
 
-    // // TODO: Include directory structure
-    // if (res.args.dirs != 0) {
-
-    // }
-
     for (0..nodes.len) |i| { // add hashes into parents
         const i_rev = nodes.len - 1 - i;
         const node = nodes[i_rev];
@@ -274,6 +269,20 @@ pub fn main() !void {
             } else {
                 nodes[parent_index].addSize(node.size);
             }
+        }
+
+        // include directory structure into hash
+        // at this point the content hash is complete, also add the name
+        // hash of a hash is different, so multiple nestings will give a different result
+        if (res.args.dirs != 0 and node.info == .dir) {
+            var hash = std.crypto.hash.Md5.init(.{});
+            if (node.hash) |node_hash| { // can be null for childless directory
+                hash.update(node_hash[0..]);
+            }
+            hash.update(&node.name);
+            var hash_buf: [dir_tree.hash_len]u8 = undefined;
+            hash.final(&hash_buf); // this is needed because node.hash is optional
+            nodes[i_rev].hash = hash_buf;
         }
     }
 
