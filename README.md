@@ -23,6 +23,11 @@ dedupiacz --help
 dedupiacz ./folder1 C:/folder2
 ```
 
+## Planowany rozwój
+
+- Lokalizacja na inne języki
+- Zapis wyników skanowania do pliku, tryb interaktywnego usuwania z zapisu
+
 ## Licencja
 
 [MIT](https://choosealicense.com/licenses/mit/)

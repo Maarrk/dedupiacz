@@ -7,6 +7,9 @@ const TreeNode = dir_tree.TreeNode;
 
 const utils = @import("utils.zig");
 
+const version: std.SemanticVersion = .{ .major = 1, .minor = 0, .patch = 0 };
+const copyright_year = 2023;
+
 pub fn main() !void {
     // On Windows, set the console code page to UTF-8
     if (builtin.os.tag == .windows) {
@@ -20,13 +23,14 @@ pub fn main() !void {
     }
 
     const params = comptime clap.parseParamsComptime(
-        \\-h, --help        Wyświetl tę pomoc i wyjdź.
+        \\-h, --help        Wyświetl tę pomoc i wyjdź
+        \\--version         Wyświetl informacje o wersji i wyjdź
         \\-v, --verbose     Wyświetlaj więcej informacji w trakcie pracy (można podać kilka razy)
         \\-q, --quiet       Wyświetlaj mniej informacji
         \\-i, --interactive Interaktywnie usuwaj pliki po przeszukaniu drzewa
         \\-d, --dirs        Traktuj nazwy folderów jako znaczące
         \\--exclude <str>   Ignoruj pliki zawierające ten tekst w ścieżce
-        \\<path>...         Ścieżki do przeszukania.
+        \\<path>...         Ścieżki do przeszukania
     ); // FIXME: Doesn't print the whole <path> line
     // Arguments roadmap:
     // \\-s, --save <file>  Zapisz wyniki skanowania do pliku JSON
@@ -47,6 +51,10 @@ pub fn main() !void {
 
     if (res.args.help != 0) {
         try clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+        return;
+    }
+    if (res.args.version != 0) {
+        try std.io.getStdOut().writer().print("dedupiacz {any}\nCopyright (c) {d} Marek S. Łukasiewicz\nMIT License\n", .{ version, copyright_year });
         return;
     }
     const verbosity: i16 = @as(i16, res.args.verbose) - @as(i16, res.args.quiet);
