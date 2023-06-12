@@ -15,7 +15,7 @@ pub const max_name_len: comptime_int = 256;
 pub const hash_len: comptime_int = std.crypto.hash.Md5.digest_length;
 
 pub const TreeNode = struct {
-    name: [max_name_len]u8 = [_]u8{0} ** max_name_len,
+    name: [max_name_len:0]u8 = [_:0]u8{0} ** max_name_len,
     parent_index: ?usize, // can only be null at the root node
     size: u64 = 0,
     hash: ?[hash_len]u8 = null,
@@ -433,5 +433,62 @@ test "iterating over subpath" {
         try expectEqualStrings("/home/smith", iter.next().?);
         try expectEqualStrings("/home/smith/document.odt", iter.next().?);
         try expectEqual(@as(?[]const u8, null), iter.next());
+    }
+}
+
+pub fn encodeTree(nodes: []TreeNode, out_stream: anytype) !void {
+    const SerializedData = struct {
+        nodes: []TreeNode,
+    };
+
+    var data = SerializedData{
+        .nodes = nodes,
+    };
+    try std.json.stringify(data, .{}, out_stream);
+}
+
+pub fn decodeTree(alloc: std.mem.Allocator, input: []const u8) !std.ArrayList(TreeNode) {
+    var parser = std.json.Parser.init(alloc, .alloc_if_needed);
+    defer parser.deinit();
+
+    const value_tree = try parser.parse(input);
+    const nodes_value = (value_tree.root.object.get("nodes") orelse return error.NodesNotFound);
+
+    var roundtrip_list = std.ArrayList(u8).init(alloc);
+    defer roundtrip_list.deinit();
+
+    var node_list = std.ArrayList(TreeNode).init(alloc);
+    errdefer node_list.deinit();
+
+    for (nodes_value.array.items) |node_value| {
+        try std.json.stringify(node_value, .{}, roundtrip_list.writer());
+        const node = try std.json.parseFromSlice(TreeNode, alloc, roundtrip_list.items, .{});
+        defer std.json.parseFree(TreeNode, alloc, node);
+        try node_list.append(node);
+        roundtrip_list.clearRetainingCapacity();
+    }
+    return node_list;
+}
+
+test "JSON encoding" {
+    var nodes: [4]TreeNode = undefined;
+    nodes[0] = TreeNode.initRoot();
+    nodes[1] = try TreeNode.initDir(&nodes, 0, "C:"); // drive
+    nodes[2] = try TreeNode.initDir(&nodes, 1, "foo"); // dir
+    nodes[3] = try TreeNode.initFile(&nodes, 2, "bar.txt", 1);
+
+    var list = std.ArrayList(u8).init(std.testing.allocator);
+    defer list.deinit();
+
+    try encodeTree(&nodes, list.writer());
+    const decoded = try decodeTree(std.testing.allocator, list.items);
+
+    for (0..nodes.len) |i| {
+        const original = nodes[i];
+        const roundtrip = decoded.items[i];
+        try expectEqualStrings(&original.name, &roundtrip.name);
+        try expectEqual(original.parent_index, roundtrip.parent_index);
+        try expectEqual(original.size, roundtrip.size);
+        // etc...
     }
 }
