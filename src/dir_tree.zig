@@ -139,7 +139,7 @@ pub const TreeNode = struct {
         var path_iter = std.mem.split(u8, path, std.fs.path.sep_str);
 
         if (builtin.os.tag != .windows) {
-            try path_iter.next(); // skip leading slash on posix
+            _ = path_iter.next(); // skip leading slash on posix
         }
 
         while (path_iter.next()) |name| {
