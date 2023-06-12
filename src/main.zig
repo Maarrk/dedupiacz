@@ -19,15 +19,19 @@ pub fn main() !void {
         }
     }
 
+    // FIXME: Doesn't print "-h, --help", and the whole <path> line
     const params = comptime clap.parseParamsComptime(
-        \\-h, --help    Wyświetl tę pomoc i wyjdź.
-        \\-v, --verbose Wyświetlaj więcej informacji w trakcie pracy (można podać kilka razy)
-        \\-q, --quiet   Wyświetlaj mniej informacji
+        \\-h, --help        Wyświetl tę pomoc i wyjdź.
+        \\-v, --verbose     Wyświetlaj więcej informacji w trakcie pracy (można podać kilka razy)
+        \\-q, --quiet       Wyświetlaj mniej informacji
         \\-i, --interactive Interaktywnie usuwaj pliki po przeszukaniu drzewa
         \\--exclude <str>   Ignoruj pliki zawierające ten tekst w ścieżce
-        \\<path>...     Ścieżki do przeszukania.
+        \\<path>...         Ścieżki do przeszukania.
     );
-    // TODO: \\-d, --dirs    Traktuj strukturę folderów jako znaczącą
+    // Arguments roadmap:
+    // \\-d, --dirs         Traktuj strukturę folderów jako znaczącą
+    // \\-s, --save <file>  Zapisz wyniki skanowania do pliku JSON
+    // \\-l, --load <file>  Wczytaj zapisane drzewo zamiast skanować ścieżkę
     const parsers = comptime .{
         .str = clap.parsers.string,
         .path = clap.parsers.string,
@@ -58,11 +62,10 @@ pub fn main() !void {
 
     var realpath_buf: [dir_tree.max_path_len]u8 = undefined;
 
-    var file_count: usize = 0;
-    var search_paths_ancestors: usize = 0; // count of folders above the passed paths, will be used to exclude them from results
-
-    // to match the types, cast array literal to "[]T - pointer to runtime-known number of items", hence the need for &
     var search_paths = if (res.positionals.len > 0) res.positionals else @as([]const []const u8, &[_][]const u8{"."});
+
+    // first put all the ancestors, so they can later be excluded from results just by index
+    var search_paths_ancestors: usize = 0; // count of folders above the passed paths
     for (search_paths) |path| {
         const realpath = try (try std.fs.cwd().openDir(path, .{})).realpath(".", &realpath_buf);
         // this workaround is necessary, because there are still bugs with ".." on windows
@@ -70,8 +73,37 @@ pub fn main() !void {
         const parent_realpath = realpath[0..std.mem.lastIndexOfScalar(u8, realpath, std.fs.path.sep).?];
         search_paths_ancestors = try dir_tree.findOrAddPathIndex(&node_list, parent_realpath) + 1; // save count
     }
-    // TODO: Validate that none of the search_paths is equal or contained in another
 
+    { // add search_paths and check that they aren't contained in another
+        var search_indices = std.ArrayList(usize).init(alloc);
+        defer search_indices.deinit();
+
+        for (search_paths) |path| {
+            const realpath = try (try std.fs.cwd().openDir(path, .{})).realpath(".", &realpath_buf);
+            const index = try dir_tree.findOrAddPathIndex(&node_list, realpath);
+            try search_indices.append(index);
+        }
+
+        for (search_indices.items) |index| {
+            var index_array = [1]usize{index}; // HACK: need a slice for std.mem.count
+            if (std.mem.containsAtLeast(usize, search_indices.items, 2, &index_array)) {
+                std.debug.print("Błąd: zduplikowana ścieżka:\n{s}\n", .{try TreeNode.fullPath(&node_list.items[index], node_list.items, &realpath_buf)});
+                return;
+            }
+
+            var ancestor_index: ?usize = node_list.items[index].parent_index;
+            while (ancestor_index) |a_idx| {
+                index_array[0] = a_idx;
+                if (std.mem.containsAtLeast(usize, search_indices.items, 1, &index_array)) {
+                    std.debug.print("Błąd: ścieżka zawarta w innej:\n{s}\n{s}\n", .{ try TreeNode.fullPath(&node_list.items[index], node_list.items, &realpath_buf), try TreeNode.fullPath(&node_list.items[a_idx], node_list.items, &realpath_buf) });
+                    return;
+                }
+                ancestor_index = node_list.items[a_idx].parent_index;
+            }
+        }
+    }
+
+    var file_count: usize = 0;
     for (search_paths) |path| {
         var walker = try (try std.fs.cwd().openIterableDir(path, .{})).walk(alloc);
         defer walker.deinit();
@@ -183,7 +215,7 @@ pub fn main() !void {
         while (try in_stream.read(&buf) > 0) {
             hash.update(&buf);
         }
-        var hash_buf: [16]u8 = undefined;
+        var hash_buf: [dir_tree.hash_len]u8 = undefined;
         hash.final(&hash_buf);
         node.hash = hash_buf;
 
@@ -198,11 +230,6 @@ pub fn main() !void {
         if (verbosity >= 0) std.debug.print("\r{s}: {d}/{d} ({d:.2}% ETA: {s}), {s}/{s} ({d:.2}% ETA: {s}), ", .{ utils.formatTime(time_elapsed), done_hashes_count, same_size_count, count_part * 100, utils.formatTime(count_eta), utils.formatSize(done_hashes_size), utils.formatSize(same_size_size), size_part * 100, utils.formatTime(size_eta) });
     }
     if (verbosity >= 0) std.debug.print("{s}\n", .{[_]u8{' '} ** 25}); // overwrite the opened file text from loop
-
-    // // TODO: Include directory structure
-    // if (res.args.dirs != 0) {
-
-    // }
 
     std.sort.sort(*TreeNode, node_ptrs[0..file_count], {}, TreeNode.sizeDesc); // also sorts by hash
     var same_file_hash_count: u64 = 0;
@@ -232,6 +259,11 @@ pub fn main() !void {
         }
     }
     if (verbosity >= 0) std.debug.print("Znaleziono {d} plików o tej samej zawartości\n", .{same_file_hash_count});
+
+    // // TODO: Include directory structure
+    // if (res.args.dirs != 0) {
+
+    // }
 
     for (0..nodes.len) |i| { // add hashes into parents
         const i_rev = nodes.len - 1 - i;

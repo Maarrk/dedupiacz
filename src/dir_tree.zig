@@ -1,3 +1,7 @@
+//! This module provides a tree of directories and files, reflecting the directory structure.
+//! They are allocated in a continuous array of memory sorted in a topological order, each parent
+//! precedes all of its children.
+
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -227,17 +231,22 @@ pub fn sumFileSizes(nodes: []TreeNode) void {
 }
 
 test "absolute path of a node" {
-    var nodes: [4]TreeNode = undefined;
+    var nodes: [5]TreeNode = undefined;
     nodes[0] = TreeNode.initRoot();
     nodes[1] = try TreeNode.initDir(&nodes, 0, "C:");
     nodes[2] = try TreeNode.initDir(&nodes, 1, "foo");
     nodes[3] = try TreeNode.initFile(&nodes, 2, "bar.txt", 1);
+    nodes[4] = try TreeNode.initDir(&nodes, 2, "directory");
 
     var path_buffer: [max_path_len]u8 = undefined;
+
     const full_path = try TreeNode.fullPath(&nodes[3], &nodes, &path_buffer);
     const expected_path = if (builtin.os.tag == .windows) "C:\\foo\\bar.txt" else "/C:/foo/bar.txt";
-
     try expectEqualStrings(expected_path, full_path);
+
+    const full_dir_path = try TreeNode.fullPath(&nodes[4], &nodes, &path_buffer);
+    const expected_dir_path = if (builtin.os.tag == .windows) "C:\\foo\\directory" else "/C:/foo/directory";
+    try expectEqualStrings(expected_dir_path, full_dir_path);
 }
 
 test "counting children" {
