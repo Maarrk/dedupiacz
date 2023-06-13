@@ -398,7 +398,7 @@ fn interactiveDeletion(nodes: []TreeNode, options: []*TreeNode, handled_duplicat
     var input_buffer: [dir_tree.max_name_len]u8 = undefined;
     var realpath_buf: [dir_tree.max_path_len]u8 = undefined;
     while (true) {
-        try out_writer.print("\n{d}/{d} Wybierz plik (rozmiar {s}) do pozostawienia, 'n' aby pominąć usuwanie, lub '0' aby usunąć wszystkie\n", .{ handled_duplicates, duplicate_elements, utils.formatSize(options[0].size) });
+        try out_writer.print("\n{d}/{d} Wybierz obiekt (rozmiar {s}) do pozostawienia, 'n' aby pominąć usuwanie, lub '0' aby usunąć wszystkie\n", .{ handled_duplicates, duplicate_elements, utils.formatSize(options[0].size) });
 
         std.sort.sort(*TreeNode, options, {}, TreeNode.nameAsc);
         for (options, 1..) |option, i| {
@@ -408,25 +408,34 @@ fn interactiveDeletion(nodes: []TreeNode, options: []*TreeNode, handled_duplicat
         var deleted_size: u64 = 0;
         const input = (try utils.nextLine(stdin.reader(), &input_buffer)).?;
         if (input[0] == 'n') {
-            try out_writer.print("Pomijam usuwanie pliku\n", .{});
+            try out_writer.print("Pomijam usuwanie obiektu\n", .{});
             return null;
         } else if (std.fmt.parseInt(u16, input, 10) catch null) |choice| {
             if (choice == 0) {
-                try out_writer.print("Usuwam wszystkie pliki\n", .{});
+                try out_writer.print("Usuwam wszystkie obiekty\n", .{});
             } else if (choice <= options.len) {
                 try out_writer.print("Pozostawiam {d}\n", .{choice});
             } else {
                 try out_writer.print("Podana liczba jest większa niż liczba opcji\n", .{});
                 continue;
             }
+            var error_count: u64 = 0;
             for (options, 1..) |deleted_node, i| {
                 if (i != choice) {
-                    try std.fs.deleteTreeAbsolute(try TreeNode.fullPath(deleted_node, nodes, &realpath_buf));
+                    const realpath = try TreeNode.fullPath(deleted_node, nodes, &realpath_buf);
+                    std.fs.deleteTreeAbsolute(realpath) catch |err| {
+                        std.debug.print("Błąd '{s}' przy usuwaniu pliku: {s}\n", .{ @errorName(err), realpath });
+                        error_count += 1;
+                        continue;
+                    };
                     deleted_size += deleted_node.size;
                 }
             }
-            return deleted_size;
+            if (error_count > 0) continue;
+
+            return deleted_size; // FIXME: for some reason crashes on this statement with "unreachable code reached"
+        } else {
+            try out_writer.print("Nie rozpoznano wejścia: {s}\n", .{input});
         }
-        try out_writer.print("Nie rozpoznano wejścia: {s}\n", .{input});
     }
 }
